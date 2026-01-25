@@ -1,23 +1,23 @@
-# fly.toml - Fly.io configuration for mixmi audio worker
+# fly.toml app configuration file generated for mixmi-audio-worker on 2026-01-25T01:34:41Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-app = "mixmi-audio-worker"
-primary_region = "sjc"
+app = 'mixmi-audio-worker'
+primary_region = 'lax'
 
 [build]
-  dockerfile = "Dockerfile"
-
-[env]
-  PORT = "3001"
-  NODE_ENV = "production"
 
 [http_service]
   internal_port = 3001
   force_https = true
-  auto_stop_machines = true
+  auto_stop_machines = 'stop'
   auto_start_machines = true
   min_machines_running = 0
+  processes = ['app']
 
 [[vm]]
-  cpu_kind = "shared"
+  memory = '1gb'
+  cpu_kind = 'shared'
   cpus = 1
   memory_mb = 512
