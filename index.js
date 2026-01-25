@@ -1,15 +1,13 @@
 const Fastify = require('fastify');
 const cors = require('@fastify/cors');
 const ffmpeg = require('fluent-ffmpeg');
-const ffmpegPath = require('ffmpeg-static');
 const { writeFile, unlink, mkdir } = require('fs/promises');
 const { existsSync } = require('fs');
 const { createReadStream } = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-// Set FFmpeg path
-ffmpeg.setFfmpegPath(ffmpegPath);
+// Use system FFmpeg (installed via apt in Dockerfile)
 
 const app = Fastify({ logger: true });
 
@@ -38,7 +36,7 @@ app.get('/', async () => {
 });
 
 app.get('/health', async () => {
-  return { status: 'healthy', ffmpeg: !!ffmpegPath };
+  return { status: 'healthy', ffmpeg: true };
 });
 
 // Main enhancement endpoint
