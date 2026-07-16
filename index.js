@@ -33,6 +33,11 @@ const ENHANCEMENT_FILTERS = {
   punchy: 'highpass=f=60,afftdn=nf=-25:nr=10,crystalizer=i=2,asubboost=dry=0.7:wet=0.3:decay=0.5:feedback=0.4:cutoff=100,compand=attacks=0.1:decays=0.4:points=-80/-80|-45/-45|-27/-20|0/-8,loudnorm=I=-12:TP=-1:LRA=9',
 };
 
+// Video transcode guards
+const MAX_VIDEO_INPUT_BYTES = 200 * 1024 * 1024; // 200MB input cap
+const MAX_VIDEO_DURATION_SEC = 600; // 10 minute cap
+const FFMPEG_TIMEOUT_MS = 8 * 60 * 1000; // kill runaway encodes
+
 // Health check
 app.get('/', async () => {
   return { status: 'ok', service: 'mixmi-audio-worker' };
@@ -131,6 +136,134 @@ app.post('/enhance', async (request, reply) => {
       try { await unlink(f); } catch (e) { /* ignore */ }
     }
 
+    return reply.status(500).send({ error: error.message });
+  }
+});
+
+// Video transcode endpoint: webm (or anything ffmpeg reads) → iPhone-safe MP4.
+// H.264 main profile + AAC, faststart, CFR 30, capped at 1280px wide.
+// Stateless like /enhance: the caller supplies a Supabase signed upload URL;
+// the worker never holds storage credentials.
+app.post('/transcode-video', async (request, reply) => {
+  const { sourceUrl, uploadUrl } = request.body || {};
+
+  if (!sourceUrl) {
+    return reply.status(400).send({ error: 'sourceUrl is required' });
+  }
+  if (!uploadUrl) {
+    return reply.status(400).send({ error: 'uploadUrl is required' });
+  }
+
+  const tempFiles = [];
+  const jobId = crypto.randomUUID();
+
+  try {
+    app.log.info({ jobId, sourceUrl }, 'Starting video transcode');
+
+    const tempDir = '/tmp/transcode';
+    if (!existsSync(tempDir)) {
+      await mkdir(tempDir, { recursive: true });
+    }
+
+    // Download source video
+    const response = await fetch(sourceUrl);
+    if (!response.ok) {
+      throw new Error(`Failed to download source: ${response.status}`);
+    }
+    const videoBuffer = Buffer.from(await response.arrayBuffer());
+    if (videoBuffer.length > MAX_VIDEO_INPUT_BYTES) {
+      return reply.status(413).send({ error: `Source exceeds ${MAX_VIDEO_INPUT_BYTES} byte cap` });
+    }
+    app.log.info({ jobId, size: videoBuffer.length }, 'Downloaded source video');
+
+    const inputExt = sourceUrl.toLowerCase().includes('.mp4') ? 'mp4' :
+                     sourceUrl.toLowerCase().includes('.mov') ? 'mov' : 'webm';
+    const inputPath = path.join(tempDir, `input-${jobId}.${inputExt}`);
+    const outputPath = path.join(tempDir, `output-${jobId}.mp4`);
+    tempFiles.push(inputPath, outputPath);
+    await writeFile(inputPath, videoBuffer);
+
+    // Probe for duration guard + whether an audio stream exists
+    const probe = await new Promise((resolve, reject) => {
+      ffmpeg.ffprobe(inputPath, (err, data) => (err ? reject(err) : resolve(data)));
+    });
+    // MediaRecorder webm often has no container duration (ffprobe says 'N/A') —
+    // normalize to 0 so the guard passes and the JSON stays numeric.
+    const durationSec = Number(probe.format?.duration) || 0;
+    if (durationSec > MAX_VIDEO_DURATION_SEC) {
+      return reply.status(413).send({ error: `Source exceeds ${MAX_VIDEO_DURATION_SEC}s duration cap` });
+    }
+    const hasAudio = (probe.streams || []).some((s) => s.codec_type === 'audio');
+
+    // Transcode. Notes for iPhone compatibility:
+    // - yuv420p is mandatory (canvas-captured webm can carry alpha)
+    // - CFR 30fps: MediaRecorder webm is variable-frame-rate, which iOS
+    //   stutters on even inside an mp4 container
+    // - faststart moves the moov atom up so playback starts while streaming
+    app.log.info({ jobId, durationSec, hasAudio }, 'Transcoding with FFmpeg...');
+    await new Promise((resolve, reject) => {
+      let command;
+      const killTimer = setTimeout(() => {
+        try { command.kill('SIGKILL'); } catch (e) { /* ignore */ }
+        reject(new Error('FFmpeg timed out'));
+      }, FFMPEG_TIMEOUT_MS);
+
+      const outputOptions = [
+        '-c:v libx264',
+        '-profile:v main',
+        '-level 4.0',
+        '-pix_fmt yuv420p',
+        '-preset veryfast',
+        '-crf 23',
+        '-movflags +faststart',
+      ];
+      if (hasAudio) {
+        outputOptions.push('-c:a aac', '-b:a 192k', '-ar 48000', '-ac 2');
+      }
+
+      command = ffmpeg(inputPath)
+        .videoFilters("scale='min(1280,iw)':-2,fps=30")
+        .outputOptions(outputOptions)
+        .format('mp4')
+        .on('start', (cmd) => app.log.info({ jobId, cmd }, 'FFmpeg started'))
+        .on('error', (err) => { clearTimeout(killTimer); reject(err); })
+        .on('end', () => { clearTimeout(killTimer); resolve(); });
+      command.save(outputPath);
+    });
+
+    const { readFile } = require('fs/promises');
+    const outputBuffer = await readFile(outputPath);
+    app.log.info({ jobId, inputSize: videoBuffer.length, outputSize: outputBuffer.length }, 'Transcode complete');
+
+    // Upload to the caller-supplied signed URL (Supabase signed upload URL)
+    const uploadResponse = await fetch(uploadUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'video/mp4' },
+      body: outputBuffer,
+    });
+    if (!uploadResponse.ok) {
+      const text = await uploadResponse.text().catch(() => '');
+      throw new Error(`Upload failed: ${uploadResponse.status} ${text.slice(0, 200)}`);
+    }
+    app.log.info({ jobId }, 'Uploaded transcoded mp4');
+
+    for (const f of tempFiles) {
+      try { await unlink(f); } catch (e) { /* ignore */ }
+    }
+
+    return reply.send({
+      success: true,
+      jobId,
+      inputSize: videoBuffer.length,
+      outputSize: outputBuffer.length,
+      durationSec,
+      hasAudio,
+    });
+  } catch (error) {
+    app.log.error({ jobId, error: error.message }, 'Video transcode failed');
+    for (const f of tempFiles) {
+      try { await unlink(f); } catch (e) { /* ignore */ }
+    }
     return reply.status(500).send({ error: error.message });
   }
 });
