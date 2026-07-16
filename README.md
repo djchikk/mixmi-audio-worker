@@ -29,6 +29,33 @@ Enhance audio with FFmpeg processing.
 
 **Response:** Returns enhanced WAV file as binary data.
 
+### POST /transcode-video
+Transcode video (webm from MediaRecorder, or anything FFmpeg reads) to iPhone-safe MP4: H.264 main profile, yuv420p, CFR 30fps, capped at 1280px wide, AAC 192k, faststart.
+
+**Request:**
+```json
+{
+  "sourceUrl": "https://…/recording.webm",
+  "uploadUrl": "https://…signed-supabase-upload-url…"
+}
+```
+
+The worker stays stateless: the caller (Vercel `/api/video/transcode`) creates a Supabase signed upload URL and the worker PUTs the mp4 there. No storage credentials on the worker.
+
+**Guards:** 200MB input cap, 10 minute duration cap, 8 minute FFmpeg kill timer.
+
+**Response:**
+```json
+{
+  "success": true,
+  "jobId": "…",
+  "inputSize": 5067885,
+  "outputSize": 6588843,
+  "durationSec": 17.9,
+  "hasAudio": true
+}
+```
+
 ## Deployment to Fly.io
 
 1. Install Fly CLI: https://fly.io/docs/hands-on/install-flyctl/
