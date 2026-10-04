@@ -6,7 +6,7 @@ const { existsSync } = require('fs');
 const { createReadStream } = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { videoHasMetadata, stripVideoMetadata, streamSummary, sameContent } = require('./lib/stripVideoMetadata');
+const { videoHasMetadata, stripVideoMetadata, streamSummary, sameContent, containerBrand } = require('./lib/stripVideoMetadata');
 const { SECRET_HEADER, secretOk, allowedStorageUrl, downloadCapped, TooLargeError } = require('./lib/guards');
 
 // Use system FFmpeg (installed via apt in Dockerfile)
@@ -287,17 +287,20 @@ app.post('/transcode-video', async (request, reply) => {
   }
 });
 
-// Strip location and every other metadata from a stored video, in place.
-// The caller (mixmi's /api/media/sanitize) supplies the public source URL and a
-// Supabase signed upload URL for the SAME path (upsert); the worker never holds
-// storage credentials. Videos already clean are left alone.
+// Strip location and every other metadata from an uploaded video or m4a.
+// Quarantine, then promote: the caller (mixmi's /api/media/promote) supplies a
+// short-lived signed URL to READ the upload from the private `media-incoming`
+// bucket and a signed upload URL to WRITE the clean copy back into that bucket
+// (`<path>.clean`); mixmi re-checks the clean copy before anything is public.
+// The worker never holds storage credentials. A file already clean is left
+// alone (`stripped: false`).
 app.post('/strip-video-metadata', async (request, reply) => {
   const { sourceUrl, uploadUrl } = request.body || {};
   if (!sourceUrl) return reply.status(400).send({ error: 'sourceUrl is required' });
   if (!uploadUrl) return reply.status(400).send({ error: 'uploadUrl is required' });
-  // Only our Storage: read a public object, write through a signed upload URL.
-  if (!allowedStorageUrl(sourceUrl, 'read')) return reply.status(400).send({ error: 'sourceUrl must be a public object in our Storage' });
-  if (!allowedStorageUrl(uploadUrl, 'upload')) return reply.status(400).send({ error: 'uploadUrl must be a signed upload URL for our Storage' });
+  // Only our Storage's private incoming bucket, through signed URLs.
+  if (!allowedStorageUrl(sourceUrl, 'read')) return reply.status(400).send({ error: 'sourceUrl must be a signed URL into our private incoming bucket' });
+  if (!allowedStorageUrl(uploadUrl, 'upload')) return reply.status(400).send({ error: 'uploadUrl must be a signed upload URL into our private incoming bucket' });
 
   const tempFiles = [];
   const jobId = crypto.randomUUID();
@@ -307,13 +310,16 @@ app.post('/strip-video-metadata', async (request, reply) => {
 
     // Content-Length checked before the body is read; the cap holds while streaming too.
     const { buffer: videoBuffer, contentType } = await downloadCapped(sourceUrl, MAX_VIDEO_INPUT_BYTES);
-    // Container by content: QuickTime ('qt  ' brand) stays .mov, everything else mp4 (incl. m4a)
-    const brand = videoBuffer.subarray(8, 12).toString('latin1');
-    const format = brand === 'qt  ' ? 'mov' : 'mp4';
-    const inputPath = path.join(tempDir, `in-${jobId}.${format}`);
-    const outputPath = path.join(tempDir, `out-${jobId}.${format}`);
-    tempFiles.push(inputPath, outputPath);
+    // Container by content (probe), never by name or first box: QuickTime
+    // (major brand 'qt') stays mov; every other ISO file (mp4, m4a, 3gp) mp4.
+    const inputPath = path.join(tempDir, `in-${jobId}`);
+    tempFiles.push(inputPath);
     await writeFile(inputPath, videoBuffer);
+    const majorBrand = await containerBrand(inputPath);
+    if (majorBrand === null) return reply.status(415).send({ error: 'Not an ISO media file' }); // temp files: finally
+    const format = majorBrand === 'qt' ? 'mov' : 'mp4';
+    const outputPath = path.join(tempDir, `out-${jobId}.${format}`);
+    tempFiles.push(outputPath);
 
     const before = await videoHasMetadata(inputPath);
     if (!before.has) {
@@ -343,12 +349,12 @@ app.post('/strip-video-metadata', async (request, reply) => {
       const text = await uploadResponse.text().catch(() => '');
       throw new Error(`Upload failed: ${uploadResponse.status} ${text.slice(0, 200)}`);
     }
-    for (const f of tempFiles) { try { await unlink(f); } catch (e) { /* ignore */ } }
     return reply.send({ success: true, jobId, stripped: true, inputSize: videoBuffer.length, outputSize: outputBuffer.length });
   } catch (error) {
     app.log.error({ jobId, error: error.message }, 'Metadata strip failed');
-    for (const f of tempFiles) { try { await unlink(f); } catch (e) { /* ignore */ } }
     return reply.status(error instanceof TooLargeError ? 413 : 500).send({ error: error.message });
+  } finally {
+    for (const f of tempFiles) { try { await unlink(f); } catch (e) { /* ignore */ } }
   }
 });
 
