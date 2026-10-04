@@ -6,7 +6,8 @@ const { existsSync } = require('fs');
 const { createReadStream } = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { videoHasMetadata, stripVideoMetadata } = require('./lib/stripVideoMetadata');
+const { videoHasMetadata, stripVideoMetadata, streamSummary, sameContent } = require('./lib/stripVideoMetadata');
+const { SECRET_HEADER, secretOk, allowedStorageUrl, downloadCapped, TooLargeError } = require('./lib/guards');
 
 // Use system FFmpeg (installed via apt in Dockerfile)
 
@@ -20,6 +21,20 @@ app.register(cors, {
     'https://www.mixmi.io',
     /\.vercel\.app$/,
   ],
+});
+
+// Every endpoint that does work requires the shared secret (MEDIA_WORKER_SECRET,
+// sent by mixmi's server as x-mixmi-worker-secret; constant-time compare). With
+// no secret configured the worker refuses all work. Open: the two liveness GETs
+// (static status, no data, no work) and CORS preflight.
+const OPEN_ROUTES = new Set(['GET /', 'GET /health']);
+app.addHook('onRequest', async (request, reply) => {
+  if (request.method === 'OPTIONS') return;
+  const route = `${request.method} ${request.url.split('?')[0]}`;
+  if (OPEN_ROUTES.has(route)) return;
+  const secret = process.env.MEDIA_WORKER_SECRET;
+  if (!secret) return reply.status(503).send({ error: 'Worker not configured' });
+  if (!secretOk(request.headers[SECRET_HEADER], secret)) return reply.status(401).send({ error: 'Unauthorized' });
 });
 
 // FFmpeg filter chains for each enhancement type
@@ -280,6 +295,9 @@ app.post('/strip-video-metadata', async (request, reply) => {
   const { sourceUrl, uploadUrl } = request.body || {};
   if (!sourceUrl) return reply.status(400).send({ error: 'sourceUrl is required' });
   if (!uploadUrl) return reply.status(400).send({ error: 'uploadUrl is required' });
+  // Only our Storage: read a public object, write through a signed upload URL.
+  if (!allowedStorageUrl(sourceUrl, 'read')) return reply.status(400).send({ error: 'sourceUrl must be a public object in our Storage' });
+  if (!allowedStorageUrl(uploadUrl, 'upload')) return reply.status(400).send({ error: 'uploadUrl must be a signed upload URL for our Storage' });
 
   const tempFiles = [];
   const jobId = crypto.randomUUID();
@@ -287,13 +305,9 @@ app.post('/strip-video-metadata', async (request, reply) => {
     const tempDir = '/tmp/strip';
     if (!existsSync(tempDir)) await mkdir(tempDir, { recursive: true });
 
-    const response = await fetch(sourceUrl);
-    if (!response.ok) throw new Error(`Failed to download source: ${response.status}`);
-    const videoBuffer = Buffer.from(await response.arrayBuffer());
-    if (videoBuffer.length > MAX_VIDEO_INPUT_BYTES) {
-      return reply.status(413).send({ error: `Source exceeds ${MAX_VIDEO_INPUT_BYTES} byte cap` });
-    }
-    // Container by content: QuickTime ('qt  ' brand) stays .mov, everything else mp4
+    // Content-Length checked before the body is read; the cap holds while streaming too.
+    const { buffer: videoBuffer, contentType } = await downloadCapped(sourceUrl, MAX_VIDEO_INPUT_BYTES);
+    // Container by content: QuickTime ('qt  ' brand) stays .mov, everything else mp4 (incl. m4a)
     const brand = videoBuffer.subarray(8, 12).toString('latin1');
     const format = brand === 'qt  ' ? 'mov' : 'mp4';
     const inputPath = path.join(tempDir, `in-${jobId}.${format}`);
@@ -303,23 +317,26 @@ app.post('/strip-video-metadata', async (request, reply) => {
 
     const before = await videoHasMetadata(inputPath);
     if (!before.has) {
-      app.log.info({ jobId }, 'Video already clean');
+      app.log.info({ jobId }, 'Already clean');
       return reply.send({ success: true, jobId, stripped: false });
     }
-    // Counts only — never the values (location must not reach the logs)
-    app.log.info({ jobId, location: before.location, formatTags: before.formatTags, streamTags: before.streamTags, dataStreams: before.dataStreams }, 'Stripping video metadata');
+    // Counts only — never the values (a location must not reach the logs)
+    app.log.info({ jobId, location: before.location, formatTags: before.formatTags, streamTags: before.streamTags, dataStreams: before.dataStreams }, 'Stripping metadata');
 
     await stripVideoMetadata(inputPath, outputPath, format, FFMPEG_TIMEOUT_MS);
     const after = await videoHasMetadata(outputPath);
-    if (after.location || after.formatTags || after.dataStreams) {
-      throw new Error('metadata survived the strip');
+    if (after.location || after.formatTags || after.dataStreams) throw new Error('metadata survived the strip');
+    // Same picture and sound streams, same duration — before anything is overwritten
+    const [inSum, outSum] = await Promise.all([streamSummary(inputPath), streamSummary(outputPath)]);
+    if (!sameContent(inSum, outSum)) {
+      throw new Error(`output doesn't match input (streams v${inSum.video}/a${inSum.audio} → v${outSum.video}/a${outSum.audio}, duration ${inSum.duration} → ${outSum.duration})`);
     }
 
     const { readFile } = require('fs/promises');
     const outputBuffer = await readFile(outputPath);
     const uploadResponse = await fetch(uploadUrl, {
       method: 'PUT',
-      headers: { 'Content-Type': format === 'mov' ? 'video/quicktime' : 'video/mp4', 'x-upsert': 'true' },
+      headers: { 'Content-Type': contentType || (format === 'mov' ? 'video/quicktime' : 'video/mp4'), 'x-upsert': 'true' },
       body: outputBuffer,
     });
     if (!uploadResponse.ok) {
@@ -329,20 +346,23 @@ app.post('/strip-video-metadata', async (request, reply) => {
     for (const f of tempFiles) { try { await unlink(f); } catch (e) { /* ignore */ } }
     return reply.send({ success: true, jobId, stripped: true, inputSize: videoBuffer.length, outputSize: outputBuffer.length });
   } catch (error) {
-    app.log.error({ jobId, error: error.message }, 'Video metadata strip failed');
+    app.log.error({ jobId, error: error.message }, 'Metadata strip failed');
     for (const f of tempFiles) { try { await unlink(f); } catch (e) { /* ignore */ } }
-    return reply.status(500).send({ error: error.message });
+    return reply.status(error instanceof TooLargeError ? 413 : 500).send({ error: error.message });
   }
 });
 
-// Start server
-const port = process.env.PORT || 3001;
-const host = process.env.HOST || '0.0.0.0';
+// Start server (only when run directly — tests require the app and use inject)
+if (require.main === module) {
+  const port = process.env.PORT || 3001;
+  const host = process.env.HOST || '0.0.0.0';
+  app.listen({ port, host }, (err) => {
+    if (err) {
+      app.log.error(err);
+      process.exit(1);
+    }
+    console.log(`🎛️ Audio worker listening on ${host}:${port}`);
+  });
+}
 
-app.listen({ port, host }, (err) => {
-  if (err) {
-    app.log.error(err);
-    process.exit(1);
-  }
-  console.log(`🎛️ Audio worker listening on ${host}:${port}`);
-});
+module.exports = app;
