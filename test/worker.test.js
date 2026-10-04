@@ -9,14 +9,15 @@ const path = require('path');
 const os = require('os');
 const { readFile, writeFile, copyFile, readdir, mkdtemp, rm } = require('fs/promises');
 const { execFile } = require('child_process');
-const media = require('../lib/stripVideoMetadata');
+const media = require('../lib/stripMedia');
 const io = require('../lib/storageIO');
 const { secretOk, SECRET_HEADER } = require('../lib/guards');
 
 let pass = 0, fail = 0;
 const check = (label, ok, detail = '') => { if (ok) { pass++; console.log(`  ✓ ${label}`); } else { fail++; console.log(`  ✗ ${label}${detail ? `\n      ${detail}` : ''}`); } };
 const FIX = (f) => path.join(__dirname, 'fixtures', f);
-const sh = (cmd, args) => new Promise((res, rej) => execFile(cmd, args, (e, so, se) => (e ? rej(new Error(se || e.message)) : res(so))));
+// ffmpeg never waits on stdin (an existing output file would otherwise prompt and hang)
+const sh = (cmd, args) => new Promise((res, rej) => execFile(cmd, cmd === 'ffmpeg' ? ['-nostdin', '-y', ...args] : args, { timeout: 120_000 }, (e, so, se) => (e ? rej(new Error(se || e.message)) : res(so))));
 const jobDirs = async () => (await readdir(os.tmpdir())).filter((d) => d.startsWith('mixmi-job-'));
 
 const HOST = 'abc.supabase.co';
@@ -32,7 +33,7 @@ async function library() {
     const b = await media.containerBrand(input);
     check(`${file}: brand by probe = ${brand} → ${format}`, b === brand, String(b));
     const before = await media.metadataReport(input, 'iso');
-    check(`${file}: carries metadata before (boxes ${before.boxes.join(',')})`, !before.clean && media.locationMarkers(await readFile(input)).length > 0);
+    check(`${file}: carries metadata before (boxes ${before.leftovers.join(',')})`, !before.clean && media.locationMarkers(await readFile(input)).length > 0);
     const out = path.join(os.tmpdir(), `wt-${Date.now()}-${file}.${format}`);
     await media.stripVideoMetadata(input, out, format);
     await media.blankMetadataBoxes(out);
@@ -47,7 +48,7 @@ async function library() {
     const out = path.join(os.tmpdir(), `wt-${Date.now()}-muxer.mp4`);
     await media.stripVideoMetadata(FIX('gps-video.mp4'), out, 'mp4');
     const raw = await media.metadataReport(out, 'iso');
-    check('verification is structural: a bare remux still has the muxer\'s udta/meta — caught', !raw.clean && raw.boxes.includes('udta'), JSON.stringify(raw));
+    check('verification is structural: a bare remux still has the muxer\'s udta/meta — caught', !raw.clean && raw.leftovers.includes('box:udta'), JSON.stringify(raw));
     await rm(out, { force: true });
   }
   {
@@ -163,59 +164,89 @@ async function endpoints() {
       global.fetch = realFetch;
     }
   };
+  // the ONE success shape: exactly { success: true, stripped: true, jobId }
+  const exact = (j) => !!j && JSON.stringify(Object.keys(j).sort()) === '["jobId","stripped","success"]' && j.success === true && j.stripped === true && typeof j.jobId === 'string' && j.jobId.length > 0;
   const writtenReport = async (buf, kind) => { const f = path.join(tmp, `w-${Date.now()}`); await writeFile(f, buf); const rep = await media.metadataReport(f, kind); const brand = kind === 'iso' ? await media.containerBrand(f) : null; await rm(f, { force: true }); return { ...rep, brand }; };
   const allLogs = [];
 
   for (const [fx, brand] of [['gps-video-free-first.mov', 'qt'], ['gps-audio-free-first.m4a', 'qt'], ['gps-video.mp4', 'isom'], ['gps-video.mov', 'qt'], ['gps-video-xyz.mov', 'qt'], ['gps-audio.m4a', 'isom']]) {
-    const c = await call('/strip-video-metadata', await readFile(FIX(fx)));
+    const c = await call('/strip-metadata', await readFile(FIX(fx)));
     allLogs.push(c.logs);
     const rep = c.uploaded && await writtenReport(c.uploaded, 'iso');
     check(`strip ${fx} (key without an extension): 200, written back in place clean, brand ${brand} kept`,
-      c.r.statusCode === 200 && c.json?.success === true && c.json?.stripped === true && typeof c.json?.jobId === 'string' && rep?.clean && rep.brand === brand && media.locationMarkers(c.uploaded).length === 0,
+      c.r.statusCode === 200 && exact(c.json) && rep?.clean && rep.brand === brand && media.locationMarkers(c.uploaded).length === 0,
       `${c.r.statusCode} ${c.r.body.slice(0, 160)} ${JSON.stringify(rep)}`);
+  }
+  {
+    // Astra's P2-1 on #646: every audio format is cleaned too — tags, comments
+    // and attached pictures (album art whose JPEG carries GPS EXIF) — never
+    // published as-is.
+    const art = FIX('gps-art.jpg');
+    const base = ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=2'];
+    const tag = ['-metadata', 'title=Fixtureville', '-metadata', 'comment=GPS 0.5 0.5'];
+    const make = async (name, args) => { const f = path.join(tmp, name); await sh('ffmpeg', [...base, ...args, f]); return f; };
+    const audio = [
+      ['mp3 with GPS-EXIF album art + ID3', await make('p2-art.mp3', ['-i', art, '-map', '0:a', '-map', '1:v', '-c:a', 'libmp3lame', '-c:v', 'copy', '-disposition:v', 'attached_pic', '-id3v2_version', '3', ...tag]), 'mp3'],
+      ['wav with a LIST/INFO chunk', await make('p2-tagged.wav', [...tag]), 'wav'],
+      ['flac with a picture block + comments', await make('p2-art.flac', ['-i', art, '-map', '0:a', '-map', '1:v', '-c:a', 'flac', '-c:v', 'copy', '-disposition:v', 'attached_pic', ...tag]), 'flac'],
+      ['ogg/opus with comments', await make('p2-tagged.ogg', ['-c:a', 'libopus', ...tag]), 'ogg'],
+      ['webm audio with tags', await make('p2-tagged-audio.webm', ['-c:a', 'libopus', ...tag]), 'matroska'],
+    ];
+    for (const [label, file, family] of audio) {
+      const src = await readFile(file);
+      const before = await media.metadataReport(file, family);
+      const c = await call('/strip-metadata', src);
+      const rep = c.uploaded && await writtenReport(c.uploaded, family);
+      const sum = c.uploaded && await (async () => { const f = path.join(tmp, `s-${Date.now()}`); await writeFile(f, c.uploaded); const r = await media.streamSummary(f); await rm(f, { force: true }); return r; })();
+      check(`audio — ${label}: dirty before, 200 (exact shape), written back clean: no tags, no picture, no EXIF/GPS bytes, sound kept`,
+        !before.clean && src.includes(Buffer.from('Fixtureville')) && c.r.statusCode === 200 && exact(c.json) && rep?.clean
+          && !c.uploaded.includes(Buffer.from('Fixtureville')) && !c.uploaded.includes(Buffer.from('GPS 0.5')) && !c.uploaded.includes(Buffer.from('Exif\0\0', 'latin1'))
+          && sum?.audio === 1 && sum?.video === 0,
+        `${c.r.statusCode} ${c.r.body.slice(0, 140)} before=${JSON.stringify(before)} after=${JSON.stringify(rep)} streams=${JSON.stringify(sum)}`);
+    }
   }
   {
     // finding 1: an input with NO tags anything checks by name still gets remuxed (no "already clean" shortcut)
     const bare = path.join(tmp, 'bare.mp4');
     await sh('ffmpeg', ['-v', 'error', '-i', FIX('gps-video.mp4'), '-map', '0:v', '-c', 'copy', '-map_metadata', '-1', '-fflags', '+bitexact', bare]);
-    const c = await call('/strip-video-metadata', await readFile(bare));
+    const c = await call('/strip-metadata', await readFile(bare));
     check('strip is unconditional: a file with no tags is still remuxed and written back (stripped: true)', c.r.statusCode === 200 && c.json?.stripped === true && !!c.uploaded, c.r.body.slice(0, 160));
   }
   {
     // the output verification is what stops a dirty file: replace the strip with a plain copy
-    const realStrip = media.stripVideoMetadata, realBlank = media.blankMetadataBoxes;
-    media.stripVideoMetadata = async (input, output) => copyFile(input, output);
+    const realStrip = media.stripMedia, realBlank = media.blankMetadataBoxes;
+    media.stripMedia = async (input, output) => copyFile(input, output);
     media.blankMetadataBoxes = async () => 0;
     try {
-      const c = await call('/strip-video-metadata', await readFile(FIX('gps-video.mov')));
+      const c = await call('/strip-metadata', await readFile(FIX('gps-video.mov')));
       check('with the strip sabotaged, the OUTPUT VERIFICATION refuses: 500 and nothing written back (fails if verifyClean is removed)', c.r.statusCode === 500 && c.uploaded === null && /metadata survived/.test(c.json?.error || ''), `${c.r.statusCode} ${c.r.body.slice(0, 160)}`);
     } finally {
-      media.stripVideoMetadata = realStrip;
+      media.stripMedia = realStrip;
       media.blankMetadataBoxes = realBlank;
     }
   }
   {
-    const c = await call('/strip-video-metadata', () => new Response(null, { status: 302, headers: { location: 'https://evil.example/x.mp4' } }));
+    const c = await call('/strip-metadata', () => new Response(null, { status: 302, headers: { location: 'https://evil.example/x.mp4' } }));
     check('the source redirects (302) → refused (500), nothing written', c.r.statusCode === 500 && c.uploaded === null && /redirect/.test(c.json?.error || ''), c.r.body.slice(0, 120));
   }
   {
-    const c = await call('/strip-video-metadata', await readFile(FIX('gps-video.mp4')), { upload: () => new Response(null, { status: 307, headers: { location: 'https://evil.example/' } }) });
+    const c = await call('/strip-metadata', await readFile(FIX('gps-video.mp4')), { upload: () => new Response(null, { status: 307, headers: { location: 'https://evil.example/' } }) });
     check('the upload redirects (307) → refused (500)', c.r.statusCode === 500, c.r.body.slice(0, 120));
   }
   {
-    const c = await call('/strip-video-metadata', await readFile(FIX('gps-video.mp4')), { upload: () => new Response('denied', { status: 403 }) });
+    const c = await call('/strip-metadata', await readFile(FIX('gps-video.mp4')), { upload: () => new Response('denied', { status: 403 }) });
     check('the write-back is refused (403) → 500, never a success', c.r.statusCode === 500 && c.json?.success !== true);
   }
   {
-    const c = await call('/strip-video-metadata', () => new Response('x', { status: 200, headers: { 'content-length': String(500 * 1024 * 1024) } }));
+    const c = await call('/strip-metadata', () => new Response('x', { status: 200, headers: { 'content-length': String(500 * 1024 * 1024) } }));
     check('a source over the cap by Content-Length → 413, nothing written', c.r.statusCode === 413 && c.uploaded === null);
   }
   {
-    const c = await call('/strip-video-metadata', () => new Response('nope', { status: 404 }));
+    const c = await call('/strip-metadata', () => new Response('nope', { status: 404 }));
     check('the source can\'t be read (404) → 500, nothing written', c.r.statusCode === 500 && c.uploaded === null);
   }
   {
-    const c = await call('/strip-video-metadata', Buffer.from('ID3 not a container at all, just bytes, padding padding'));
+    const c = await call('/strip-metadata', Buffer.from('ID3 not a container at all, just bytes, padding padding'));
     check('bytes that are not ISO media → 415, nothing written', c.r.statusCode === 415 && c.uploaded === null);
   }
   for (const [label, opts] of [
@@ -224,7 +255,7 @@ async function endpoints() {
     ['a public bucket as the destination', { uploadUrl: upUrl('0xabc/5f1e', 'video-clips') }],
     ['another host', { sourceUrl: readUrl().replace(HOST, 'evil.example') }],
   ]) {
-    for (const ep of ['/strip-video-metadata', '/transcode-video', '/enhance']) {
+    for (const ep of ['/strip-metadata', '/transcode-video', '/enhance']) {
       const c = await call(ep, Buffer.from('x'), opts);
       if (c.r.statusCode !== 400 || c.uploaded !== null) { check(`${ep}: ${label} → 400`, false, `${c.r.statusCode}`); }
     }
@@ -235,7 +266,7 @@ async function endpoints() {
     const c = await call('/transcode-video', await readFile(webm), { type: 'video/webm' });
     allLogs.push(c.logs);
     const rep = c.uploaded && await writtenReport(c.uploaded, 'iso');
-    check('transcode: tagged webm → 200, an mp4 written back IN PLACE with no metadata (title and encoder name gone)', c.r.statusCode === 200 && c.json?.success === true && rep?.clean && !c.uploaded.includes(Buffer.from('Lavc')) && rep.brand === 'isom' && !c.uploaded.includes(Buffer.from('Fixtureville')) && c.uploadHeaders?.['Content-Type'] === 'video/mp4', `${c.r.statusCode} ${c.r.body.slice(0, 160)} ${JSON.stringify(rep)}`);
+    check('transcode: tagged webm → 200 (exact success shape), an mp4 written back IN PLACE with no metadata (title and encoder name gone)', c.r.statusCode === 200 && exact(c.json) && rep?.clean && !c.uploaded.includes(Buffer.from('Lavc')) && rep.brand === 'isom' && !c.uploaded.includes(Buffer.from('Fixtureville')) && c.uploadHeaders?.['Content-Type'] === 'video/mp4', `${c.r.statusCode} ${c.r.body.slice(0, 160)} ${JSON.stringify(rep)}`);
   }
   {
     const c = await call('/transcode-video', () => new Response(null, { status: 301, headers: { location: 'https://evil.example/' } }));
@@ -245,7 +276,7 @@ async function endpoints() {
     const c = await call('/enhance', await readFile(wav), { type: 'audio/wav', body: { enhancementType: 'clean' } });
     allLogs.push(c.logs);
     const rep = c.uploaded && await writtenReport(c.uploaded, 'wav');
-    check('enhance: tagged WAV → 200, an enhanced WAV written back IN PLACE with only fmt/data chunks (title gone)', c.r.statusCode === 200 && c.json?.success === true && rep?.clean && !c.uploaded.includes(Buffer.from('Fixtureville')), `${c.r.statusCode} ${c.r.body.slice(0, 160)} ${JSON.stringify(rep)}`);
+    check('enhance: tagged WAV → 200 (exact success shape), an enhanced WAV written back IN PLACE with only fmt/data chunks (title gone)', c.r.statusCode === 200 && exact(c.json) && rep?.clean && !c.uploaded.includes(Buffer.from('Fixtureville')), `${c.r.statusCode} ${c.r.body.slice(0, 160)} ${JSON.stringify(rep)}`);
   }
   {
     const c = await call('/enhance', await readFile(wav), { body: { enhancementType: 'nope' } });
@@ -262,10 +293,10 @@ async function endpoints() {
 
   console.log('\nThe secret, at the HTTP level');
   delete process.env.MEDIA_WORKER_SECRET;
-  const r0 = await app.inject({ method: 'POST', url: '/strip-video-metadata', payload: {} });
+  const r0 = await app.inject({ method: 'POST', url: '/strip-metadata', payload: {} });
   check('no secret configured on the worker → every work endpoint refuses (503)', r0.statusCode === 503);
   process.env.MEDIA_WORKER_SECRET = 'test-secret-for-the-suite';
-  for (const url of ['/strip-video-metadata', '/transcode-video', '/enhance']) {
+  for (const url of ['/strip-metadata', '/transcode-video', '/enhance']) {
     const none = await app.inject({ method: 'POST', url, payload: {} });
     const wrong = await app.inject({ method: 'POST', url, payload: {}, headers: { [SECRET_HEADER]: 'wrong' } });
     check(`${url}: without the secret 401, with a wrong one 401`, none.statusCode === 401 && wrong.statusCode === 401, `${none.statusCode}/${wrong.statusCode}`);

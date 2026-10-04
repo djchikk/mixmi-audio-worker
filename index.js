@@ -5,7 +5,7 @@ const path = require('path');
 const crypto = require('crypto');
 // Through the module object (not destructured): the endpoint tests swap a
 // step out to prove the output verification is what refuses a dirty file.
-const media = require('./lib/stripVideoMetadata');
+const media = require('./lib/stripMedia');
 const { SECRET_HEADER, secretOk } = require('./lib/guards');
 const io = require('./lib/storageIO');
 
@@ -113,10 +113,12 @@ function inPlaceEndpoint(name, work, validate = () => null) {
         app.log.info({ jobId, ref, endpoint: name, bytes: got.bytes }, 'Downloaded');
         const out = await work({ jobId, ref, dir, input, contentType: got.contentType, body: request.body || {} });
         const up = await io.uploadFile(uploadUrl, out.file, out.contentType, { deadlineMs: UPLOAD_DEADLINE_MS });
-        app.log.info({ jobId, ref, endpoint: name, bytes: up.bytes }, 'Written back in place');
-        return { ...out.reply, inputSize: got.bytes, outputSize: up.bytes };
+        app.log.info({ jobId, ref, endpoint: name, bytes: up.bytes, ...out.log }, 'Written back in place');
       });
-      return reply.send({ success: true, jobId, ...result });
+      // The ONE success shape, for every endpoint: exactly these three fields.
+      // Every endpoint writes a verified metadata-free file, so stripped is
+      // always true. (mixmi accepts nothing else as success.)
+      return reply.send({ success: true, stripped: true, jobId });
     } catch (error) {
       const status = error instanceof io.TooLargeError ? 413 : error instanceof UnsupportedError ? 415 : error instanceof io.DeadlineError ? 504 : 500;
       app.log.error({ jobId, ref, endpoint: name, error: scrub(error.message) }, 'Job failed');
@@ -129,7 +131,7 @@ function inPlaceEndpoint(name, work, validate = () => null) {
 async function verifyClean(file, kind) {
   const report = await media.metadataReport(file, kind, PROBE_DEADLINE_MS);
   if (!report.clean) {
-    throw new VerificationError(`metadata survived (boxes ${report.boxes.join(',') || '-'}, format tags ${report.formatTags}, stream tags ${report.streamTags}, data streams ${report.dataStreams})`);
+    throw new VerificationError(`metadata survived (${report.leftovers.join(',') || '-'}, format tags ${report.formatTags}, stream tags ${report.streamTags}, other streams ${report.otherStreams})`);
   }
 }
 
@@ -149,7 +151,7 @@ app.post('/enhance', inPlaceEndpoint('enhance', async ({ dir, input, body }) => 
     .format('wav')
     .save(output));
   await verifyClean(output, 'wav');
-  return { file: output, contentType: 'audio/wav', reply: { enhancementType } };
+  return { file: output, contentType: 'audio/wav', log: { enhancementType } };
 }, (body) => (ENHANCEMENT_FILTERS[body.enhancementType || 'auto'] ? null : 'Invalid enhancementType')));
 
 // Video transcode: webm (or anything ffmpeg reads) → iPhone-safe MP4, written
@@ -189,31 +191,31 @@ app.post('/transcode-video', inPlaceEndpoint('transcode', async ({ dir, input })
     .save(output));
   await media.blankMetadataBoxes(output);
   await verifyClean(output, 'iso');
-  return { file: output, contentType: 'video/mp4', reply: { durationSec, hasAudio } };
+  return { file: output, contentType: 'video/mp4', log: { durationSec, hasAudio } };
 }));
 
-// Strip location and every other metadata from an uploaded video or m4a —
-// unconditionally (no "already clean" shortcut): remux with no metadata, blank
-// any metadata box the muxer still writes, VERIFY the output carries none, and
-// check it kept every stream and its duration. Written back in place; mixmi
-// re-checks it before promoting it out of the private incoming bucket.
-app.post('/strip-video-metadata', inPlaceEndpoint('strip', async ({ dir, input, contentType }) => {
-  // Container by content (probe), never by name or first box: QuickTime
-  // (major brand 'qt', or no ftyp at all) stays mov; every other ISO file mp4.
-  const brand = await media.containerBrand(input, PROBE_DEADLINE_MS);
-  if (brand === null) throw new UnsupportedError('Not an ISO media file');
-  const format = brand === 'qt' ? 'mov' : 'mp4';
-  const output = path.join(dir, `out.${format}`);
-  await media.stripVideoMetadata(input, output, format, FFMPEG_TIMEOUT_MS);
-  await media.blankMetadataBoxes(output);
-  await verifyClean(output, 'iso');
-  // Same picture and sound streams, same duration — before anything is written back
+// Strip every bit of metadata from an uploaded media file — video or audio,
+// any container mixmi accepts (mp4 / mov / m4a, mp3, wav, flac, ogg, webm) —
+// unconditionally: remux losslessly with no metadata, tags or attached pictures
+// (lib/stripMedia), blank any metadata box the muxer still writes, VERIFY the
+// output carries none by its structure, and check it kept every real stream
+// and its duration. Written back in place; mixmi re-checks it before promoting
+// it out of the private incoming bucket.
+app.post('/strip-metadata', inPlaceEndpoint('strip', async ({ dir, input, contentType }) => {
+  // Container by content (probe), never by name or first box.
+  const fmt = await media.mediaFormat(input, PROBE_DEADLINE_MS);
+  if (!fmt) throw new UnsupportedError('Not a media file this worker accepts');
+  const output = path.join(dir, `out.${fmt.muxer}`);
+  await media.stripMedia(input, output, fmt, FFMPEG_TIMEOUT_MS);
+  if (fmt.family === 'iso') await media.blankMetadataBoxes(output);
+  await verifyClean(output, fmt.family);
+  // Same real picture and sound streams, same duration — before anything is written back
   const [inSum, outSum] = await Promise.all([media.streamSummary(input, PROBE_DEADLINE_MS), media.streamSummary(output, PROBE_DEADLINE_MS)]);
   if (!media.sameContent(inSum, outSum)) {
     throw new VerificationError(`output doesn't match input (streams v${inSum.video}/a${inSum.audio} → v${outSum.video}/a${outSum.audio}, duration ${inSum.duration} → ${outSum.duration})`);
   }
-  const type = /^(video|audio)\//.test(contentType || '') ? contentType : format === 'mov' ? 'video/quicktime' : 'video/mp4';
-  return { file: output, contentType: type, reply: { stripped: true, container: format } };
+  const type = /^(video|audio)\//.test(contentType || '') ? contentType : 'application/octet-stream';
+  return { file: output, contentType: type, log: { family: fmt.family } };
 }));
 
 // Start server (only when run directly — tests require the app and use inject)
