@@ -6,6 +6,7 @@ const { existsSync } = require('fs');
 const { createReadStream } = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { videoHasMetadata, stripVideoMetadata } = require('./lib/stripVideoMetadata');
 
 // Use system FFmpeg (installed via apt in Dockerfile)
 
@@ -216,6 +217,9 @@ app.post('/transcode-video', async (request, reply) => {
         '-preset veryfast',
         '-crf 23',
         '-movflags +faststart',
+        // never carry the source's metadata (a phone's location, creation time, …)
+        '-map_metadata -1',
+        '-map_chapters -1',
       ];
       if (hasAudio) {
         outputOptions.push('-c:a aac', '-b:a 192k', '-ar 48000', '-ac 2');
@@ -264,6 +268,69 @@ app.post('/transcode-video', async (request, reply) => {
     for (const f of tempFiles) {
       try { await unlink(f); } catch (e) { /* ignore */ }
     }
+    return reply.status(500).send({ error: error.message });
+  }
+});
+
+// Strip location and every other metadata from a stored video, in place.
+// The caller (mixmi's /api/media/sanitize) supplies the public source URL and a
+// Supabase signed upload URL for the SAME path (upsert); the worker never holds
+// storage credentials. Videos already clean are left alone.
+app.post('/strip-video-metadata', async (request, reply) => {
+  const { sourceUrl, uploadUrl } = request.body || {};
+  if (!sourceUrl) return reply.status(400).send({ error: 'sourceUrl is required' });
+  if (!uploadUrl) return reply.status(400).send({ error: 'uploadUrl is required' });
+
+  const tempFiles = [];
+  const jobId = crypto.randomUUID();
+  try {
+    const tempDir = '/tmp/strip';
+    if (!existsSync(tempDir)) await mkdir(tempDir, { recursive: true });
+
+    const response = await fetch(sourceUrl);
+    if (!response.ok) throw new Error(`Failed to download source: ${response.status}`);
+    const videoBuffer = Buffer.from(await response.arrayBuffer());
+    if (videoBuffer.length > MAX_VIDEO_INPUT_BYTES) {
+      return reply.status(413).send({ error: `Source exceeds ${MAX_VIDEO_INPUT_BYTES} byte cap` });
+    }
+    // Container by content: QuickTime ('qt  ' brand) stays .mov, everything else mp4
+    const brand = videoBuffer.subarray(8, 12).toString('latin1');
+    const format = brand === 'qt  ' ? 'mov' : 'mp4';
+    const inputPath = path.join(tempDir, `in-${jobId}.${format}`);
+    const outputPath = path.join(tempDir, `out-${jobId}.${format}`);
+    tempFiles.push(inputPath, outputPath);
+    await writeFile(inputPath, videoBuffer);
+
+    const before = await videoHasMetadata(inputPath);
+    if (!before.has) {
+      app.log.info({ jobId }, 'Video already clean');
+      return reply.send({ success: true, jobId, stripped: false });
+    }
+    // Counts only — never the values (location must not reach the logs)
+    app.log.info({ jobId, location: before.location, formatTags: before.formatTags, streamTags: before.streamTags, dataStreams: before.dataStreams }, 'Stripping video metadata');
+
+    await stripVideoMetadata(inputPath, outputPath, format, FFMPEG_TIMEOUT_MS);
+    const after = await videoHasMetadata(outputPath);
+    if (after.location || after.formatTags || after.dataStreams) {
+      throw new Error('metadata survived the strip');
+    }
+
+    const { readFile } = require('fs/promises');
+    const outputBuffer = await readFile(outputPath);
+    const uploadResponse = await fetch(uploadUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': format === 'mov' ? 'video/quicktime' : 'video/mp4', 'x-upsert': 'true' },
+      body: outputBuffer,
+    });
+    if (!uploadResponse.ok) {
+      const text = await uploadResponse.text().catch(() => '');
+      throw new Error(`Upload failed: ${uploadResponse.status} ${text.slice(0, 200)}`);
+    }
+    for (const f of tempFiles) { try { await unlink(f); } catch (e) { /* ignore */ } }
+    return reply.send({ success: true, jobId, stripped: true, inputSize: videoBuffer.length, outputSize: outputBuffer.length });
+  } catch (error) {
+    app.log.error({ jobId, error: error.message }, 'Video metadata strip failed');
+    for (const f of tempFiles) { try { await unlink(f); } catch (e) { /* ignore */ } }
     return reply.status(500).send({ error: error.message });
   }
 });
