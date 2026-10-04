@@ -1,13 +1,13 @@
 const Fastify = require('fastify');
 const cors = require('@fastify/cors');
 const ffmpeg = require('fluent-ffmpeg');
-const { writeFile, unlink, mkdir } = require('fs/promises');
-const { existsSync } = require('fs');
-const { createReadStream } = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { videoHasMetadata, stripVideoMetadata, streamSummary, sameContent, containerBrand } = require('./lib/stripVideoMetadata');
-const { SECRET_HEADER, secretOk, allowedStorageUrl, downloadCapped, TooLargeError } = require('./lib/guards');
+// Through the module object (not destructured): the endpoint tests swap a
+// step out to prove the output verification is what refuses a dirty file.
+const media = require('./lib/stripVideoMetadata');
+const { SECRET_HEADER, secretOk } = require('./lib/guards');
+const io = require('./lib/storageIO');
 
 // Use system FFmpeg (installed via apt in Dockerfile)
 
@@ -49,10 +49,13 @@ const ENHANCEMENT_FILTERS = {
   punchy: 'highpass=f=60,afftdn=nf=-25:nr=10,crystalizer=i=2,asubboost=dry=0.7:wet=0.3:decay=0.5:feedback=0.4:cutoff=100,compand=attacks=0.1:decays=0.4:points=-80/-80|-45/-45|-27/-20|0/-8,loudnorm=I=-12:TP=-1:LRA=9',
 };
 
-// Video transcode guards
-const MAX_VIDEO_INPUT_BYTES = 200 * 1024 * 1024; // 200MB input cap
+// Guards
+const MAX_INPUT_BYTES = 200 * 1024 * 1024; // 200MB input cap (audio and video)
 const MAX_VIDEO_DURATION_SEC = 600; // 10 minute cap
 const FFMPEG_TIMEOUT_MS = 8 * 60 * 1000; // kill runaway encodes
+const DOWNLOAD_DEADLINE_MS = 3 * 60 * 1000; // the whole download, start to last byte
+const UPLOAD_DEADLINE_MS = 3 * 60 * 1000;
+const PROBE_DEADLINE_MS = 60 * 1000;
 
 // Health check
 app.get('/', async () => {
@@ -63,300 +66,155 @@ app.get('/health', async () => {
   return { status: 'healthy', ffmpeg: true };
 });
 
-// Main enhancement endpoint
-app.post('/enhance', async (request, reply) => {
-  const { sourceUrl, enhancementType = 'auto' } = request.body;
+class UnsupportedError extends Error {}
+class VerificationError extends Error {}
 
-  if (!sourceUrl) {
-    return reply.status(400).send({ error: 'sourceUrl is required' });
+/** Error text for logs and replies: never a URL (they carry tokens). */
+const scrub = (msg) => String(msg || 'failed').replace(/https?:\/\/\S+/g, '[url]').slice(0, 300);
+
+/** Run an ffmpeg command under a deadline. */
+function runFfmpeg(build, timeoutMs = FFMPEG_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    let command;
+    const killTimer = setTimeout(() => {
+      try { command.kill('SIGKILL'); } catch (e) { /* ignore */ }
+      reject(new Error('FFmpeg timed out'));
+    }, timeoutMs);
+    command = build()
+      .on('error', (err) => { clearTimeout(killTimer); reject(err); })
+      .on('end', () => { clearTimeout(killTimer); resolve(); });
+  });
+}
+
+/**
+ * Every endpoint, one shape (lib/storageIO): the request names a signed READ
+ * URL for an object in mixmi's private incoming bucket and a signed UPLOAD URL
+ * for THE SAME object. The worker downloads it (streamed, capped, deadline),
+ * `work` turns it into an output file that has passed its own verification,
+ * and the output is written back in place (deadline). Temp files: one temp dir,
+ * removed in finally. Logs: jobId + bucket/key only.
+ */
+function inPlaceEndpoint(name, work, validate = () => null) {
+  return async (request, reply) => {
+    const jobId = crypto.randomUUID();
+    const { sourceUrl, uploadUrl } = request.body || {};
+    let ref;
+    try {
+      ({ ref } = io.inPlaceTarget(sourceUrl, uploadUrl));
+    } catch (e) {
+      return reply.status(400).send({ error: e.message });
+    }
+    const invalid = validate(request.body || {});
+    if (invalid) return reply.status(400).send({ error: invalid });
+    try {
+      const result = await io.withTempDir(async (dir) => {
+        const input = path.join(dir, 'in');
+        const got = await io.downloadToFile(sourceUrl, input, { maxBytes: MAX_INPUT_BYTES, deadlineMs: DOWNLOAD_DEADLINE_MS });
+        app.log.info({ jobId, ref, endpoint: name, bytes: got.bytes }, 'Downloaded');
+        const out = await work({ jobId, ref, dir, input, contentType: got.contentType, body: request.body || {} });
+        const up = await io.uploadFile(uploadUrl, out.file, out.contentType, { deadlineMs: UPLOAD_DEADLINE_MS });
+        app.log.info({ jobId, ref, endpoint: name, bytes: up.bytes }, 'Written back in place');
+        return { ...out.reply, inputSize: got.bytes, outputSize: up.bytes };
+      });
+      return reply.send({ success: true, jobId, ...result });
+    } catch (error) {
+      const status = error instanceof io.TooLargeError ? 413 : error instanceof UnsupportedError ? 415 : error instanceof io.DeadlineError ? 504 : 500;
+      app.log.error({ jobId, ref, endpoint: name, error: scrub(error.message) }, 'Job failed');
+      return reply.status(status).send({ error: scrub(error.message) });
+    }
+  };
+}
+
+/** The output must carry no metadata at all (structure and tags), or the job fails. */
+async function verifyClean(file, kind) {
+  const report = await media.metadataReport(file, kind, PROBE_DEADLINE_MS);
+  if (!report.clean) {
+    throw new VerificationError(`metadata survived (boxes ${report.boxes.join(',') || '-'}, format tags ${report.formatTags}, stream tags ${report.streamTags}, data streams ${report.dataStreams})`);
   }
+}
 
-  if (!ENHANCEMENT_FILTERS[enhancementType]) {
-    return reply.status(400).send({ error: 'Invalid enhancementType' });
-  }
+// Enhance: an audio file → enhanced WAV, written back in place. mixmi then
+// promotes it from the private incoming bucket (re-checked) to its public path.
+app.post('/enhance', inPlaceEndpoint('enhance', async ({ dir, input, body }) => {
+  const enhancementType = body.enhancementType || 'auto';
+  const filterChain = ENHANCEMENT_FILTERS[enhancementType];
+  const output = path.join(dir, 'out.wav');
+  await runFfmpeg(() => ffmpeg(input)
+    .audioFilters(filterChain)
+    .audioCodec('pcm_s16le')
+    .audioFrequency(48000)
+    .audioChannels(1)
+    // never carry the source's metadata; no encoder tag of our own
+    .outputOptions(['-map_metadata -1', '-map_chapters -1', '-fflags +bitexact', '-flags:a +bitexact'])
+    .format('wav')
+    .save(output));
+  await verifyClean(output, 'wav');
+  return { file: output, contentType: 'audio/wav', reply: { enhancementType } };
+}, (body) => (ENHANCEMENT_FILTERS[body.enhancementType || 'auto'] ? null : 'Invalid enhancementType')));
 
-  const tempFiles = [];
-  const jobId = crypto.randomUUID();
-
+// Video transcode: webm (or anything ffmpeg reads) → iPhone-safe MP4, written
+// back in place. H.264 main profile + AAC, faststart, CFR 30, capped at 1280px
+// wide. mixmi then promotes it (re-checked) to its public path.
+app.post('/transcode-video', inPlaceEndpoint('transcode', async ({ dir, input }) => {
+  let probe;
   try {
-    app.log.info({ jobId, sourceUrl, enhancementType }, 'Starting enhancement');
-
-    // Ensure temp directory exists
-    const tempDir = '/tmp/enhance';
-    if (!existsSync(tempDir)) {
-      await mkdir(tempDir, { recursive: true });
-    }
-
-    // Download source audio
-    app.log.info({ jobId }, 'Downloading source audio...');
-    const response = await fetch(sourceUrl);
-    if (!response.ok) {
-      throw new Error(`Failed to download: ${response.status}`);
-    }
-
-    const audioBuffer = Buffer.from(await response.arrayBuffer());
-    app.log.info({ jobId, size: audioBuffer.length }, 'Downloaded audio');
-
-    // Determine input format
-    const inputExt = sourceUrl.includes('.wav') ? 'wav' :
-                     sourceUrl.includes('.webm') ? 'webm' :
-                     sourceUrl.includes('.mp3') ? 'mp3' : 'wav';
-
-    const inputPath = path.join(tempDir, `input-${jobId}.${inputExt}`);
-    const outputPath = path.join(tempDir, `output-${jobId}.wav`);
-    tempFiles.push(inputPath, outputPath);
-
-    // Write input file
-    await writeFile(inputPath, audioBuffer);
-
-    // Process with FFmpeg
-    app.log.info({ jobId, enhancementType }, 'Processing with FFmpeg...');
-    const filterChain = ENHANCEMENT_FILTERS[enhancementType];
-
-    await new Promise((resolve, reject) => {
-      ffmpeg(inputPath)
-        .audioFilters(filterChain)
-        .audioCodec('pcm_s16le')
-        .audioFrequency(48000)
-        .audioChannels(1)
-        .format('wav')
-        .on('start', (cmd) => app.log.info({ jobId, cmd }, 'FFmpeg started'))
-        .on('error', (err) => reject(err))
-        .on('end', () => resolve())
-        .save(outputPath);
-    });
-
-    app.log.info({ jobId }, 'FFmpeg processing complete');
-
-    // Read and return the enhanced file
-    const { readFile } = require('fs/promises');
-    const enhancedBuffer = await readFile(outputPath);
-
-    app.log.info({ jobId, inputSize: audioBuffer.length, outputSize: enhancedBuffer.length }, 'Enhancement complete');
-
-    // Cleanup temp files
-    for (const f of tempFiles) {
-      try { await unlink(f); } catch (e) { /* ignore */ }
-    }
-
-    // Return the enhanced audio as WAV
-    reply.header('Content-Type', 'audio/wav');
-    reply.header('Content-Disposition', `attachment; filename="enhanced-${jobId}.wav"`);
-    return reply.send(enhancedBuffer);
-
-  } catch (error) {
-    app.log.error({ jobId, error: error.message }, 'Enhancement failed');
-
-    // Cleanup on error
-    for (const f of tempFiles) {
-      try { await unlink(f); } catch (e) { /* ignore */ }
-    }
-
-    return reply.status(500).send({ error: error.message });
+    probe = await io.probeFile(input, PROBE_DEADLINE_MS);
+  } catch (e) {
+    if (e instanceof io.DeadlineError) throw e;
+    throw new UnsupportedError('Not a video ffmpeg can read');
   }
-});
+  // MediaRecorder webm often has no container duration (ffprobe says 'N/A') —
+  // normalize to 0 so the guard passes and the JSON stays numeric.
+  const durationSec = Number(probe.format?.duration) || 0;
+  if (durationSec > MAX_VIDEO_DURATION_SEC) throw new io.TooLargeError(`Source exceeds ${MAX_VIDEO_DURATION_SEC}s duration cap`);
+  const hasAudio = (probe.streams || []).some((s) => s.codec_type === 'audio');
+  // Notes for iPhone compatibility:
+  // - yuv420p is mandatory (canvas-captured webm can carry alpha)
+  // - CFR 30fps: MediaRecorder webm is variable-frame-rate, which iOS
+  //   stutters on even inside an mp4 container
+  // - faststart moves the moov atom up so playback starts while streaming
+  const outputOptions = [
+    '-map 0:v:0',
+    '-c:v libx264', '-profile:v main', '-level 4.0', '-pix_fmt yuv420p', '-preset veryfast', '-crf 23',
+    '-movflags +faststart',
+    // never carry the source's metadata (a phone's location, creation time, …)
+    '-map_metadata -1', '-map_chapters -1', '-fflags +bitexact', '-flags:v +bitexact',
+  ];
+  if (hasAudio) outputOptions.push('-map 0:a:0', '-c:a aac', '-b:a 192k', '-ar 48000', '-ac 2', '-flags:a +bitexact');
+  const output = path.join(dir, 'out.mp4');
+  await runFfmpeg(() => ffmpeg(input)
+    .videoFilters("scale='min(1280,iw)':-2,fps=30")
+    .outputOptions(outputOptions)
+    .format('mp4')
+    .save(output));
+  await media.blankMetadataBoxes(output);
+  await verifyClean(output, 'iso');
+  return { file: output, contentType: 'video/mp4', reply: { durationSec, hasAudio } };
+}));
 
-// Video transcode endpoint: webm (or anything ffmpeg reads) → iPhone-safe MP4.
-// H.264 main profile + AAC, faststart, CFR 30, capped at 1280px wide.
-// Stateless like /enhance: the caller supplies a Supabase signed upload URL;
-// the worker never holds storage credentials.
-app.post('/transcode-video', async (request, reply) => {
-  const { sourceUrl, uploadUrl } = request.body || {};
-
-  if (!sourceUrl) {
-    return reply.status(400).send({ error: 'sourceUrl is required' });
+// Strip location and every other metadata from an uploaded video or m4a —
+// unconditionally (no "already clean" shortcut): remux with no metadata, blank
+// any metadata box the muxer still writes, VERIFY the output carries none, and
+// check it kept every stream and its duration. Written back in place; mixmi
+// re-checks it before promoting it out of the private incoming bucket.
+app.post('/strip-video-metadata', inPlaceEndpoint('strip', async ({ dir, input, contentType }) => {
+  // Container by content (probe), never by name or first box: QuickTime
+  // (major brand 'qt', or no ftyp at all) stays mov; every other ISO file mp4.
+  const brand = await media.containerBrand(input, PROBE_DEADLINE_MS);
+  if (brand === null) throw new UnsupportedError('Not an ISO media file');
+  const format = brand === 'qt' ? 'mov' : 'mp4';
+  const output = path.join(dir, `out.${format}`);
+  await media.stripVideoMetadata(input, output, format, FFMPEG_TIMEOUT_MS);
+  await media.blankMetadataBoxes(output);
+  await verifyClean(output, 'iso');
+  // Same picture and sound streams, same duration — before anything is written back
+  const [inSum, outSum] = await Promise.all([media.streamSummary(input, PROBE_DEADLINE_MS), media.streamSummary(output, PROBE_DEADLINE_MS)]);
+  if (!media.sameContent(inSum, outSum)) {
+    throw new VerificationError(`output doesn't match input (streams v${inSum.video}/a${inSum.audio} → v${outSum.video}/a${outSum.audio}, duration ${inSum.duration} → ${outSum.duration})`);
   }
-  if (!uploadUrl) {
-    return reply.status(400).send({ error: 'uploadUrl is required' });
-  }
-
-  const tempFiles = [];
-  const jobId = crypto.randomUUID();
-
-  try {
-    app.log.info({ jobId, sourceUrl }, 'Starting video transcode');
-
-    const tempDir = '/tmp/transcode';
-    if (!existsSync(tempDir)) {
-      await mkdir(tempDir, { recursive: true });
-    }
-
-    // Download source video
-    const response = await fetch(sourceUrl);
-    if (!response.ok) {
-      throw new Error(`Failed to download source: ${response.status}`);
-    }
-    const videoBuffer = Buffer.from(await response.arrayBuffer());
-    if (videoBuffer.length > MAX_VIDEO_INPUT_BYTES) {
-      return reply.status(413).send({ error: `Source exceeds ${MAX_VIDEO_INPUT_BYTES} byte cap` });
-    }
-    app.log.info({ jobId, size: videoBuffer.length }, 'Downloaded source video');
-
-    const inputExt = sourceUrl.toLowerCase().includes('.mp4') ? 'mp4' :
-                     sourceUrl.toLowerCase().includes('.mov') ? 'mov' : 'webm';
-    const inputPath = path.join(tempDir, `input-${jobId}.${inputExt}`);
-    const outputPath = path.join(tempDir, `output-${jobId}.mp4`);
-    tempFiles.push(inputPath, outputPath);
-    await writeFile(inputPath, videoBuffer);
-
-    // Probe for duration guard + whether an audio stream exists
-    const probe = await new Promise((resolve, reject) => {
-      ffmpeg.ffprobe(inputPath, (err, data) => (err ? reject(err) : resolve(data)));
-    });
-    // MediaRecorder webm often has no container duration (ffprobe says 'N/A') —
-    // normalize to 0 so the guard passes and the JSON stays numeric.
-    const durationSec = Number(probe.format?.duration) || 0;
-    if (durationSec > MAX_VIDEO_DURATION_SEC) {
-      return reply.status(413).send({ error: `Source exceeds ${MAX_VIDEO_DURATION_SEC}s duration cap` });
-    }
-    const hasAudio = (probe.streams || []).some((s) => s.codec_type === 'audio');
-
-    // Transcode. Notes for iPhone compatibility:
-    // - yuv420p is mandatory (canvas-captured webm can carry alpha)
-    // - CFR 30fps: MediaRecorder webm is variable-frame-rate, which iOS
-    //   stutters on even inside an mp4 container
-    // - faststart moves the moov atom up so playback starts while streaming
-    app.log.info({ jobId, durationSec, hasAudio }, 'Transcoding with FFmpeg...');
-    await new Promise((resolve, reject) => {
-      let command;
-      const killTimer = setTimeout(() => {
-        try { command.kill('SIGKILL'); } catch (e) { /* ignore */ }
-        reject(new Error('FFmpeg timed out'));
-      }, FFMPEG_TIMEOUT_MS);
-
-      const outputOptions = [
-        '-c:v libx264',
-        '-profile:v main',
-        '-level 4.0',
-        '-pix_fmt yuv420p',
-        '-preset veryfast',
-        '-crf 23',
-        '-movflags +faststart',
-        // never carry the source's metadata (a phone's location, creation time, …)
-        '-map_metadata -1',
-        '-map_chapters -1',
-      ];
-      if (hasAudio) {
-        outputOptions.push('-c:a aac', '-b:a 192k', '-ar 48000', '-ac 2');
-      }
-
-      command = ffmpeg(inputPath)
-        .videoFilters("scale='min(1280,iw)':-2,fps=30")
-        .outputOptions(outputOptions)
-        .format('mp4')
-        .on('start', (cmd) => app.log.info({ jobId, cmd }, 'FFmpeg started'))
-        .on('error', (err) => { clearTimeout(killTimer); reject(err); })
-        .on('end', () => { clearTimeout(killTimer); resolve(); });
-      command.save(outputPath);
-    });
-
-    const { readFile } = require('fs/promises');
-    const outputBuffer = await readFile(outputPath);
-    app.log.info({ jobId, inputSize: videoBuffer.length, outputSize: outputBuffer.length }, 'Transcode complete');
-
-    // Upload to the caller-supplied signed URL (Supabase signed upload URL)
-    const uploadResponse = await fetch(uploadUrl, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'video/mp4' },
-      body: outputBuffer,
-    });
-    if (!uploadResponse.ok) {
-      const text = await uploadResponse.text().catch(() => '');
-      throw new Error(`Upload failed: ${uploadResponse.status} ${text.slice(0, 200)}`);
-    }
-    app.log.info({ jobId }, 'Uploaded transcoded mp4');
-
-    for (const f of tempFiles) {
-      try { await unlink(f); } catch (e) { /* ignore */ }
-    }
-
-    return reply.send({
-      success: true,
-      jobId,
-      inputSize: videoBuffer.length,
-      outputSize: outputBuffer.length,
-      durationSec,
-      hasAudio,
-    });
-  } catch (error) {
-    app.log.error({ jobId, error: error.message }, 'Video transcode failed');
-    for (const f of tempFiles) {
-      try { await unlink(f); } catch (e) { /* ignore */ }
-    }
-    return reply.status(500).send({ error: error.message });
-  }
-});
-
-// Strip location and every other metadata from an uploaded video or m4a.
-// Quarantine, then promote: the caller (mixmi's /api/media/promote) supplies a
-// short-lived signed URL to READ the upload from the private `media-incoming`
-// bucket and a signed upload URL to WRITE the clean copy back into that bucket
-// (`<path>.clean`); mixmi re-checks the clean copy before anything is public.
-// The worker never holds storage credentials. A file already clean is left
-// alone (`stripped: false`).
-app.post('/strip-video-metadata', async (request, reply) => {
-  const { sourceUrl, uploadUrl } = request.body || {};
-  if (!sourceUrl) return reply.status(400).send({ error: 'sourceUrl is required' });
-  if (!uploadUrl) return reply.status(400).send({ error: 'uploadUrl is required' });
-  // Only our Storage's private incoming bucket, through signed URLs.
-  if (!allowedStorageUrl(sourceUrl, 'read')) return reply.status(400).send({ error: 'sourceUrl must be a signed URL into our private incoming bucket' });
-  if (!allowedStorageUrl(uploadUrl, 'upload')) return reply.status(400).send({ error: 'uploadUrl must be a signed upload URL into our private incoming bucket' });
-
-  const tempFiles = [];
-  const jobId = crypto.randomUUID();
-  try {
-    const tempDir = '/tmp/strip';
-    if (!existsSync(tempDir)) await mkdir(tempDir, { recursive: true });
-
-    // Content-Length checked before the body is read; the cap holds while streaming too.
-    const { buffer: videoBuffer, contentType } = await downloadCapped(sourceUrl, MAX_VIDEO_INPUT_BYTES);
-    // Container by content (probe), never by name or first box: QuickTime
-    // (major brand 'qt') stays mov; every other ISO file (mp4, m4a, 3gp) mp4.
-    const inputPath = path.join(tempDir, `in-${jobId}`);
-    tempFiles.push(inputPath);
-    await writeFile(inputPath, videoBuffer);
-    const majorBrand = await containerBrand(inputPath);
-    if (majorBrand === null) return reply.status(415).send({ error: 'Not an ISO media file' }); // temp files: finally
-    const format = majorBrand === 'qt' ? 'mov' : 'mp4';
-    const outputPath = path.join(tempDir, `out-${jobId}.${format}`);
-    tempFiles.push(outputPath);
-
-    const before = await videoHasMetadata(inputPath);
-    if (!before.has) {
-      app.log.info({ jobId }, 'Already clean');
-      return reply.send({ success: true, jobId, stripped: false });
-    }
-    // Counts only — never the values (a location must not reach the logs)
-    app.log.info({ jobId, location: before.location, formatTags: before.formatTags, streamTags: before.streamTags, dataStreams: before.dataStreams }, 'Stripping metadata');
-
-    await stripVideoMetadata(inputPath, outputPath, format, FFMPEG_TIMEOUT_MS);
-    const after = await videoHasMetadata(outputPath);
-    if (after.location || after.formatTags || after.dataStreams) throw new Error('metadata survived the strip');
-    // Same picture and sound streams, same duration — before anything is overwritten
-    const [inSum, outSum] = await Promise.all([streamSummary(inputPath), streamSummary(outputPath)]);
-    if (!sameContent(inSum, outSum)) {
-      throw new Error(`output doesn't match input (streams v${inSum.video}/a${inSum.audio} → v${outSum.video}/a${outSum.audio}, duration ${inSum.duration} → ${outSum.duration})`);
-    }
-
-    const { readFile } = require('fs/promises');
-    const outputBuffer = await readFile(outputPath);
-    const uploadResponse = await fetch(uploadUrl, {
-      method: 'PUT',
-      headers: { 'Content-Type': contentType || (format === 'mov' ? 'video/quicktime' : 'video/mp4'), 'x-upsert': 'true' },
-      body: outputBuffer,
-    });
-    if (!uploadResponse.ok) {
-      const text = await uploadResponse.text().catch(() => '');
-      throw new Error(`Upload failed: ${uploadResponse.status} ${text.slice(0, 200)}`);
-    }
-    return reply.send({ success: true, jobId, stripped: true, inputSize: videoBuffer.length, outputSize: outputBuffer.length });
-  } catch (error) {
-    app.log.error({ jobId, error: error.message }, 'Metadata strip failed');
-    return reply.status(error instanceof TooLargeError ? 413 : 500).send({ error: error.message });
-  } finally {
-    for (const f of tempFiles) { try { await unlink(f); } catch (e) { /* ignore */ } }
-  }
-});
+  const type = /^(video|audio)\//.test(contentType || '') ? contentType : format === 'mov' ? 'video/quicktime' : 'video/mp4';
+  return { file: output, contentType: type, reply: { stripped: true, container: format } };
+}));
 
 // Start server (only when run directly — tests require the app and use inject)
 if (require.main === module) {
