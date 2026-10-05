@@ -6,6 +6,7 @@
 // the same files with the ftyp retyped to `free` (no ftyp: legacy QuickTime).
 // Run: npm test  (needs ffmpeg + ffprobe on PATH)
 const path = require('path');
+const fs = require('fs');
 const os = require('os');
 const { readFile, writeFile, copyFile, readdir, mkdtemp, rm } = require('fs/promises');
 const { execFile } = require('child_process');
@@ -20,6 +21,20 @@ const FIX = (f) => path.join(__dirname, 'fixtures', f);
 const sh = (cmd, args) => new Promise((res, rej) => execFile(cmd, cmd === 'ffmpeg' ? ['-nostdin', '-y', ...args] : args, { timeout: 120_000 }, (e, so, se) => (e ? rej(new Error(se || e.message)) : res(so))));
 const crypto = require('crypto');
 const sei = require('../lib/videoSei');
+/** The HDR10+ T.35 payload x265 wrote into test/fixtures/hdr.mp4 (ffmpeg reads it as SMPTE 2094-40). */
+async function hdr10PlusFromFixture() {
+  const es = path.join(os.tmpdir(), `hdr-${process.pid}.hevc`);
+  await sh('ffmpeg', ['-v', 'error', '-i', FIX('hdr.mp4'), '-map', '0:v:0', '-c', 'copy', '-bsf:v', 'hevc_mp4toannexb', '-f', 'hevc', es]);
+  const b = await readFile(es); await rm(es, { force: true });
+  for (let i = 0; i + 4 < b.length; i++) {
+    if (b[i] === 0 && b[i + 1] === 0 && b[i + 2] === 1 && ((b[i + 3] >> 1) & 0x3f) === 39) {
+      let j = i + 3; while (j + 2 < b.length && !(b[j] === 0 && b[j + 1] === 0 && b[j + 2] <= 1)) j++;
+      const m = sei.seiMessages(sei.unescape(b.subarray(i + 5, j))).find((x) => x.type === 4);
+      if (m) return Buffer.from(m.payload);
+    }
+  }
+  throw new Error('fixture: no T.35 payload');
+}
 /** Decoded audio (first audio stream → s16le PCM), hashed: proves the SOUND is unchanged, not just stream counts. */
 const pcmHash = async (file) => { const out = `${file}.pcm`; await sh('ffmpeg', ['-v', 'error', '-i', file, '-map', '0:a:0', '-f', 's16le', '-c:a', 'pcm_s16le', out]); const h = crypto.createHash('sha256').update(await readFile(out)).digest('hex'); await rm(out, { force: true }); return h; };
 /** Decoded video frames, hashed (framemd5 of the first picture stream). */
@@ -344,14 +359,91 @@ async function endpoints() {
   }
   {
     // the per-NAL policy, by structure (unit level): HDR10+ kept; captions / other T.35 private; sharing → refused
-    const sei1 = (msgs) => { const parts = [Buffer.from([0x06])]; for (const [t, p] of msgs) parts.push(Buffer.from([t, p.length]), p); parts.push(Buffer.from([0x80])); return Buffer.concat(parts); };
-    const hdr10p = Buffer.from([0xb5, 0x00, 0x3c, 0x00, 0x01, 0x04, 0x01, 0x40, 0x00, 0x0c]);
+    const escape = (b) => { const o = []; let z = 0; for (const x of b) { if (z >= 2 && x <= 3) { o.push(3); z = 0; } o.push(x); z = x === 0 ? z + 1 : 0; } return Buffer.from(o); };
+    const sei1 = (msgs) => { const parts = []; for (const [t, p] of msgs) parts.push(Buffer.from([t, p.length]), p); parts.push(Buffer.from([0x80])); return Buffer.concat([Buffer.from([0x06]), escape(Buffer.concat(parts))]); };
+    const hdr10p = await hdr10PlusFromFixture();
     const captions = Buffer.concat([Buffer.from([0xb5, 0x00, 0x31]), Buffer.from('GA94'), Buffer.from([0x03, 0x40, 0x00])]);
     const ud5 = Buffer.concat([Buffer.alloc(16, 7), Buffer.from('GPS')]);
     const v = (msgs) => sei.nalVerdict(sei1(msgs), 'h264').verdict;
-    check('per NAL: HDR10+ alone → keep · captions (T.35 GA94) → neutralize · user data + buffering/timing → neutralize · user data + HDR10+ → REFUSE · captions + mastering display (137) → REFUSE · timing alone → keep',
-      v([[4, hdr10p]]) === 'keep' && v([[4, captions]]) === 'neutralize' && v([[5, ud5], [0, Buffer.from([0x80])], [1, Buffer.from([0x10])]]) === 'neutralize' && v([[5, ud5], [4, hdr10p]]) === 'refuse' && v([[4, captions], [137, Buffer.alloc(24)]]) === 'refuse' && v([[1, Buffer.from([0x10])]]) === 'keep');
-    check('HDR10+ is identified by its exact T.35 header (country B5, provider 003C, oriented 0001, app 4, version ≤ 1)', sei.isHdr10Plus(hdr10p) && !sei.isHdr10Plus(Buffer.from([0xb5, 0x00, 0x3c, 0x00, 0x01, 0x05, 0x01])) && !sei.isHdr10Plus(captions) && !sei.isHdr10Plus(Buffer.from([0xb5])));
+    check('per NAL, CLOSED: HDR10+ alone → keep · captions (T.35 GA94) alone → neutralize · user data + buffering period / filler → neutralize · user data + picture_timing → REFUSE · user data + recovery point → REFUSE · user data + HDR10+ → REFUSE · captions + mastering display → REFUSE · user data + an unknown type (200) → REFUSE · timing alone → keep',
+      v([[4, hdr10p]]) === 'keep' && v([[4, captions]]) === 'neutralize' && v([[5, ud5], [0, Buffer.from([0x80])], [3, Buffer.from([0xff, 0xff])]]) === 'neutralize'
+        && v([[5, ud5], [1, Buffer.from([0x10])]]) === 'refuse' && v([[5, ud5], [6, Buffer.from([0x84])]]) === 'refuse' && v([[5, ud5], [4, hdr10p]]) === 'refuse'
+        && v([[4, captions], [137, Buffer.alloc(24)]]) === 'refuse' && v([[5, ud5], [200, Buffer.from([1])]]) === 'refuse' && v([[1, Buffer.from([0x10])]]) === 'keep');
+    // P3: the WHOLE structure is parsed, nothing after it (the payload is x265's own, which ffmpeg reads as SMPTE 2094-40)
+    const flipLast = Buffer.from(hdr10p); flipLast[flipLast.length - 1] ^= 1;
+    check('HDR10+ = the whole ST 2094-40 structure: x265\'s real payload passes; one trailing byte (even 0x00), trailing text, one byte short, a wrong header, zero windows, or a flipped final bit → NOT HDR10+',
+      sei.isHdr10Plus(hdr10p) && !sei.isHdr10Plus(Buffer.concat([hdr10p, Buffer.from([0])])) && !sei.isHdr10Plus(Buffer.concat([hdr10p, Buffer.from('GPS')])) && !sei.isHdr10Plus(hdr10p.subarray(0, -1))
+        && !sei.isHdr10Plus(Buffer.concat([Buffer.from([0xb5, 0x00, 0x3c, 0x00, 0x01, 0x05]), hdr10p.subarray(6)])) && !sei.isHdr10Plus(Buffer.concat([hdr10p.subarray(0, 7), Buffer.from([hdr10p[7] & 0x3f]), hdr10p.subarray(8)])) && !sei.isHdr10Plus(flipLast) && !sei.isHdr10Plus(captions),
+      `len ${hdr10p.length}`);
+  }
+  {
+    // 1 — presentation flags survive; private data beside picture_timing is refused
+    const ps = path.join(tmp, 'ps.mp4');
+    await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'testsrc=duration=2:size=128x96:rate=25', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-flags', '+ilme+ildct', '-x264-params', 'tff=1:pic-struct=1', ps]);
+    // the three presentation fields only (csv would also print a frame's side data — e.g. the very user data removed)
+    const flags = async (f) => JSON.stringify(JSON.parse(await sh('ffprobe', ['-v', 'error', '-select_streams', 'v', '-show_entries', 'frame=interlaced_frame,top_field_first,repeat_pict', '-of', 'json', f])).frames.map((x) => [x.interlaced_frame, x.top_field_first, x.repeat_pict]));
+    const traced = async (f) => { const o = await new Promise((res) => execFile('ffmpeg', ['-nostdin', '-v', 'trace', '-i', f, '-c', 'copy', '-bsf:v', 'trace_headers', '-f', 'null', '-'], { maxBuffer: 64 << 20 }, (e, so, se) => res(se))); return (o.match(/\b(pic_struct|ct_type|nuit_field_based_flag|counting_type|full_timestamp_flag)\s+\S+\s*=\s*\d+/g) || []).join('|'); };
+    const psIn = await sei.seiReport(ps, 'h264', tmp);
+    const c = await call('/strip-metadata', await readFile(ps));
+    const out = c.uploaded && await writeTmp(c.uploaded, '.mp4');
+    const [fIn, fOut, tIn, tOut] = out ? await Promise.all([flags(ps), flags(out), traced(ps), traced(out)]) : [];
+    const psOut = out && await sei.seiReport(out, 'h264', tmp);
+    check(`interlaced x264 with picture_timing in EVERY frame (${psIn.types['1']} messages, their own NALs) + x264's user data in a NAL of its own: 200; private gone; every picture_timing message and every frame's presentation flags (interlaced, top_field_first, repeat_pict) IDENTICAL`,
+      psIn.types['1'] === 50 && c.r.statusCode === 200 && psOut?.private === 0 && psOut?.types['1'] === 50 && !!fIn && fIn === fOut && /pic_struct/.test(tIn) && tIn === tOut && (await frameHash(ps)) === (await frameHash(out)),
+      `${c.r.statusCode} ${c.r.body.slice(0, 100)} ${JSON.stringify(psOut)} flags ${fIn === fOut} timing ${tIn === tOut} ${tIn.slice(0, 60)}`);
+    if (out) await rm(out, { force: true });
+    // the mixed NAL, built by hand: a user-data message put INTO the first picture_timing SEI NAL
+    const es = path.join(tmp, 'ps.h264');
+    await sh('ffmpeg', ['-v', 'error', '-i', ps, '-map', '0:v:0', '-c', 'copy', '-bsf:v', 'h264_mp4toannexb', '-f', 'h264', es]);
+    const raw = await readFile(es);
+    let at = -1;
+    for (let i = 0; i + 5 < raw.length; i++) if (raw[i] === 0 && raw[i + 1] === 0 && raw[i + 2] === 1 && (raw[i + 3] & 0x1f) === 6 && raw[i + 4] === 1) { at = i + 4; break; } // SEI NAL whose first message is type 1
+    if (at < 0) throw new Error('fixture: no picture_timing SEI NAL');
+    const udMsg = Buffer.concat([Buffer.from([5, 16 + 20]), Buffer.from('086f3693b7b34f2c965321492feee5b8', 'hex'), Buffer.from('GPS 0.5 Fixtureville')]);
+    const mixedEs = path.join(tmp, 'mixed.h264'), mixed = path.join(tmp, 'mixed.mp4');
+    await writeFile(mixedEs, Buffer.concat([raw.subarray(0, at), udMsg, raw.subarray(at)]));
+    await sh('ffmpeg', ['-v', 'error', '-framerate', '25', '-f', 'h264', '-i', mixedEs, '-c', 'copy', mixed]);
+    const mIn = await sei.seiReport(mixed, 'h264', tmp);
+    const cm = await call('/strip-metadata', await readFile(mixed));
+    check('private user data in the SAME SEI NAL as picture_timing → REFUSED (415), nothing written', mIn.refuseNals === 1 && cm.r.statusCode === 415 && cm.uploaded === null && /picture-relevant|shares/.test(cm.json?.error || ''), `${JSON.stringify(mIn)} ${cm.r.statusCode} ${cm.r.body.slice(0, 120)}`);
+    // HDR10+ (x265's own, read by ffmpeg as SMPTE 2094-40): kept; x265's private settings message gone
+    const ch = await call('/strip-metadata', await readFile(FIX('hdr.mp4')));
+    const hOut = ch.uploaded && await writeTmp(ch.uploaded, '.mp4');
+    const side = hOut && (await sh('ffprobe', ['-v', 'error', '-select_streams', 'v', '-show_frames', hOut])).match(/HDR Dynamic Metadata SMPTE2094-40/g)?.length;
+    check('HDR10+ video (x265): 200; the HDR10+ metadata survives on every frame (2 of 2); no private message left; frames identical', ch.r.statusCode === 200 && side === 2 && (await sei.seiReport(hOut, 'hevc', tmp)).private === 0 && (await frameHash(FIX('hdr.mp4'))) === (await frameHash(hOut)), `${ch.r.statusCode} ${ch.r.body.slice(0, 100)} side ${side}`);
+    if (hOut) await rm(hOut, { force: true });
+  }
+  {
+    // 2 — TRUE length, by counting, on every path; timestamps and declared durations are never trusted
+    const squeezedAudio = path.join(tmp, 'squeezed.webm'), squeezedVideo = path.join(tmp, 'squeezed.mp4');
+    await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'sine=duration=30', '-af', 'asetpts=PTS/10', '-c:a', 'libopus', squeezedAudio]);
+    await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'testsrc=duration=60:size=64x48:rate=30', '-vf', 'setpts=PTS/10', '-fps_mode', 'passthrough', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', squeezedVideo]);
+    const declared = async (f) => Number((await sh('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', f])).trim());
+    const [dA, dV] = [await declared(squeezedAudio), await declared(squeezedVideo)];
+    const withEnv = async (k, v, fn) => { process.env[k] = v; try { return await fn(); } finally { delete process.env[k]; } };
+    const e1 = await withEnv('ENHANCE_MAX_DURATION_SEC', '10', () => call('/enhance', fs.readFileSync(squeezedAudio), { body: { enhancementType: 'clean' } }));
+    check(`enhance: 30 s of audio with timestamps squeezed ×10 (declares ${dA.toFixed(1)} s), cap 10 s → 413 measured by SAMPLES (~11 s counted, then stopped)`, dA < 4 && e1.r.statusCode === 413 && /measured: 1[01]\.\d\+ s of audio/.test(e1.json?.error || '') && e1.uploaded === null, `${e1.r.statusCode} ${e1.r.body.slice(0, 140)}`);
+    const s1 = await withEnv('STRIP_MAX_DURATION_SEC', '10', () => call('/strip-metadata', fs.readFileSync(squeezedAudio)));
+    check('strip: the same squeezed audio, cap 10 s → 413 measured by samples', s1.r.statusCode === 413 && /measured/.test(s1.json?.error || '') && s1.uploaded === null, `${s1.r.statusCode} ${s1.r.body.slice(0, 140)}`);
+    const t1 = await withEnv('TRANSCODE_MAX_DURATION_SEC', '20', () => call('/transcode-video', fs.readFileSync(squeezedVideo)));
+    check(`transcode: 1800 frames with timestamps squeezed ×10 (declares ${dV.toFixed(1)} s), cap 20 s → 413 by FRAME COUNT (budget 20 × 60)`, dV < 7 && t1.r.statusCode === 413 && /1201\+ frames/.test(t1.json?.error || '') && t1.uploaded === null, `${t1.r.statusCode} ${t1.r.body.slice(0, 140)}`);
+    // 601 s, duration-less live WebM (ordinary MediaRecorder output) through transcode — with audio, and picture-only
+    const live = path.join(tmp, 'live601.webm'), liveV = path.join(tmp, 'live700v.webm');
+    await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'testsrc=duration=601:size=32x32:rate=5', '-f', 'lavfi', '-i', 'sine=duration=601', '-c:v', 'libvpx', '-b:v', '20k', '-c:a', 'libopus', '-b:a', '16k', '-live', '1', '-f', 'webm', live]);
+    await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'testsrc=duration=700:size=32x32:rate=5', '-c:v', 'libvpx', '-b:v', '20k', '-live', '1', '-f', 'webm', liveV]);
+    const noDur = async (f) => { const d = (await sh('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', f])).trim(); return d === '' || d === 'N/A'; };
+    const t2 = await call('/transcode-video', fs.readFileSync(live), { type: 'video/webm' });
+    check('transcode: a 601 s live WebM with NO declared duration (video + audio), cap 600 s → 413, measured by samples, nothing written', (await noDur(live)) && t2.r.statusCode === 413 && /measured: 601\.\d\+ s of audio/.test(t2.json?.error || '') && t2.uploaded === null, `${t2.r.statusCode} ${t2.r.body.slice(0, 140)}`);
+    const t3 = await call('/transcode-video', fs.readFileSync(liveV), { type: 'video/webm' });
+    check('transcode: 700 s of duration-less live WebM, picture only (3500 frames, under the frame budget) → the hard -frames limit STOPS the output at exactly 18030 frames (601 s; 21000 without it) → 413, nothing written', (await noDur(liveV)) && t3.r.statusCode === 413 && /reached the 600s limit \(18030 frames/.test(t3.json?.error || '') && t3.uploaded === null, `${t3.r.statusCode} ${t3.r.body.slice(0, 140)}`);
+    // strip: hard byte limit (-fs) and exact packet counts
+    const song = path.join(tmp, 'song.mp3');
+    await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'sine=duration=30', '-c:a', 'libmp3lame', '-b:a', '128k', song]);
+    const s2 = await withEnv('STRIP_MAX_OUTPUT_BYTES', '100000', () => call('/strip-metadata', fs.readFileSync(song)));
+    const stopped = Number(/stopped at (\d+) bytes/.exec(s2.json?.error || '')?.[1]);
+    check(`strip: output over its byte cap (30 s mp3 ≈ 480 KB, cap 100 KB) → 413, -fs STOPPED it at ${stopped} bytes (≤ cap + 64 KB; fails if -fs is removed)`, s2.r.statusCode === 413 && stopped >= 100000 && stopped <= 100000 + 65536 && s2.uploaded === null, `${s2.r.statusCode} ${s2.r.body.slice(0, 140)}`);
+    const src = await readFile(require.resolve('../index.js'), 'utf8');
+    check('no ffmpeg run trusts a timestamp limit or a declared duration (no -t, no format.duration)', !/'-t'|-t \$\{|format\?\.duration|format\.duration/.test(src));
   }
   {
     // 1a — the scanner at EVERY offset around a chunk edge: H.264 and both HEVC SEI layouts, 3- and 4-byte start codes

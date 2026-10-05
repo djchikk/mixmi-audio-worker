@@ -3,13 +3,13 @@ const cors = require('@fastify/cors');
 const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const crypto = require('crypto');
-const { execFile } = require('child_process');
 // Through the module object (not destructured): the endpoint tests swap a
 // step out to prove the output verification is what refuses a dirty file.
 const media = require('./lib/stripMedia');
 const { SECRET_HEADER, secretOk } = require('./lib/guards');
 const io = require('./lib/storageIO');
 const sei = require('./lib/videoSei');
+const limits = require('./lib/limits');
 
 // Use system FFmpeg (installed via apt in Dockerfile)
 
@@ -53,7 +53,6 @@ const ENHANCEMENT_FILTERS = {
 
 // Guards
 const MAX_INPUT_BYTES = 200 * 1024 * 1024; // 200MB input cap (audio and video)
-const MAX_VIDEO_DURATION_SEC = 600; // 10 minute cap
 const FFMPEG_TIMEOUT_MS = 8 * 60 * 1000; // kill runaway encodes
 const DOWNLOAD_DEADLINE_MS = 3 * 60 * 1000; // the whole download, start to last byte
 const UPLOAD_DEADLINE_MS = 3 * 60 * 1000;
@@ -63,6 +62,16 @@ const PROBE_DEADLINE_MS = 60 * 1000;
 const enhanceCaps = () => ({
   maxDurationSec: Number(process.env.ENHANCE_MAX_DURATION_SEC) || 15 * 60, // 15 min of audio
   maxOutputBytes: Number(process.env.ENHANCE_MAX_OUTPUT_BYTES) || 200 * 1024 * 1024, // ≈ 17 min of 48 kHz mono WAV
+});
+const transcodeCaps = () => ({
+  maxDurationSec: Number(process.env.TRANSCODE_MAX_DURATION_SEC) || 600, // 10 min
+  maxOutputBytes: Number(process.env.TRANSCODE_MAX_OUTPUT_BYTES) || 400 * 1024 * 1024,
+});
+// A strip is a lossless remux: its output is bounded by the input it copies
+// (packet counts, below) and bytes slightly over the input's.
+const stripCaps = (inputBytes) => ({
+  maxDurationSec: Number(process.env.STRIP_MAX_DURATION_SEC) || 4 * 3600, // a long DJ mix
+  maxOutputBytes: Number(process.env.STRIP_MAX_OUTPUT_BYTES) || Math.ceil(inputBytes * 1.02) + 1024 * 1024,
 });
 
 // Health check
@@ -143,19 +152,31 @@ async function verifyClean(file, kind) {
   }
 }
 
-/**
- * Seconds of audio actually decoded from the first audio stream, decoding at
- * most `limitSec` (ffmpeg -t). Never the container's declared duration.
- */
-function measureAudioSeconds(input, limitSec, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    execFile('ffmpeg', ['-nostdin', '-v', 'error', '-i', input, '-map', '0:a:0', '-t', String(limitSec), '-f', 'null', '-', '-progress', 'pipe:1', '-nostats'], { timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024 }, (err, stdout) => {
-      if (err) return reject(err.killed ? new io.DeadlineError('measuring the audio timed out') : new UnsupportedError('The audio could not be decoded'));
-      const us = [...String(stdout).matchAll(/^out_time_us=(\d+)/gm)].map((m) => Number(m[1]));
-      if (!us.length || !/progress=end/.test(stdout)) return reject(new UnsupportedError('The audio could not be measured'));
-      resolve(Math.max(...us) / 1e6);
-    });
-  });
+/** limits.* errors → the worker's statuses. */
+async function counted(fn) {
+  try {
+    return await fn();
+  } catch (e) {
+    if (e.deadline) throw new io.DeadlineError('measuring the media timed out');
+    if (e instanceof limits.LimitError) throw new UnsupportedError(`The media ${e.message}`);
+    throw e;
+  }
+}
+
+/** Refuse an input whose TRUE length (counted samples / frames) is over the cap. */
+async function measureOrRefuse(input, { hasAudio, hasVideo, capSec, what }) {
+  const m = await counted(() => limits.trueDuration(input, { hasAudio, hasVideo, capSec, timeoutMs: FFMPEG_TIMEOUT_MS }));
+  if (m.over) {
+    const got = [m.audioSec !== null && `${m.audioSec.toFixed(1)}+ s of audio`, m.videoFrames !== null && `${m.videoFrames}+ frames`].filter(Boolean).join(', ');
+    throw new io.TooLargeError(`${what} exceeds the ${capSec}s cap (measured: ${got})`);
+  }
+  return m;
+}
+
+/** An output that reached its byte cap was cut short by -fs: refused. */
+async function refuseIfCut(output, maxBytes, what) {
+  const written = await io.fileSize(output);
+  if (written >= maxBytes) throw new io.TooLargeError(`${what} output exceeds the ${maxBytes}-byte cap (stopped at ${written} bytes)`);
 }
 
 /** Neutralize private SEI in place; refuse when it shares a NAL with picture-relevant SEI. */
@@ -187,11 +208,11 @@ app.post('/enhance', inPlaceEndpoint('enhance', async ({ dir, input, body }) => 
   // The container's declared duration is never trusted (it can be missing or
   // wrong): the audio is DECODED to measure it — bounded at the cap + 1 s, so a
   // very long file costs at most the cap's worth of decoding.
-  const measured = await measureAudioSeconds(input, caps.maxDurationSec + 1, FFMPEG_TIMEOUT_MS);
-  if (measured > caps.maxDurationSec) throw new io.TooLargeError(`Input exceeds the ${caps.maxDurationSec}s enhancement cap (measured)`);
+  await measureOrRefuse(input, { hasAudio: true, hasVideo: false, capSec: caps.maxDurationSec, what: 'Input (enhancement)' });
   const output = path.join(dir, 'out.wav');
+  const endSample = (caps.maxDurationSec + 1) * 48000; // a duration limit by SAMPLE COUNT
   await runFfmpeg(() => ffmpeg(input)
-    .audioFilters(filterChain)
+    .audioFilters(`${filterChain},aresample=48000,atrim=end_sample=${endSample}`)
     .audioCodec('pcm_s16le')
     .audioFrequency(48000)
     .audioChannels(1)
@@ -200,9 +221,10 @@ app.post('/enhance', inPlaceEndpoint('enhance', async ({ dir, input, body }) => 
     .outputOptions(['-map 0:a:0', '-map_metadata -1', '-map_chapters -1', '-fflags +bitexact', '-flags:a +bitexact', `-fs ${caps.maxOutputBytes}`])
     .format('wav')
     .save(output));
-  // reaching the cap means the output was cut short — refused, never uploaded
-  const written = await io.fileSize(output);
-  if (written >= caps.maxOutputBytes) throw new io.TooLargeError(`Enhanced output exceeds the ${caps.maxOutputBytes}-byte cap (stopped at ${written} bytes)`);
+  // reaching either limit means the output was cut short — refused, never uploaded
+  await refuseIfCut(output, caps.maxOutputBytes, 'Enhanced');
+  const outSec = await counted(() => limits.audioSeconds(output, caps.maxDurationSec + 1, FFMPEG_TIMEOUT_MS));
+  if (outSec > caps.maxDurationSec) throw new io.TooLargeError(`Enhanced output reached the ${caps.maxDurationSec}s limit`);
   await verifyClean(output, 'wav');
   return { file: output, contentType: 'audio/wav', log: { enhancementType } };
 }, (body) => (ENHANCEMENT_FILTERS[body.enhancementType || 'auto'] ? null : 'Invalid enhancementType')));
@@ -218,11 +240,14 @@ app.post('/transcode-video', inPlaceEndpoint('transcode', async ({ dir, input })
     if (e instanceof io.DeadlineError) throw e;
     throw new UnsupportedError('Not a video ffmpeg can read');
   }
-  // MediaRecorder webm often has no container duration (ffprobe says 'N/A') —
-  // normalize to 0 so the guard passes and the JSON stays numeric.
-  const durationSec = Number(probe.format?.duration) || 0;
-  if (durationSec > MAX_VIDEO_DURATION_SEC) throw new io.TooLargeError(`Source exceeds ${MAX_VIDEO_DURATION_SEC}s duration cap`);
+  const caps = transcodeCaps();
   const hasAudio = (probe.streams || []).some((s) => s.codec_type === 'audio');
+  const hasVideo = (probe.streams || []).some((s) => s.codec_type === 'video' && !s.disposition?.attached_pic);
+  if (!hasVideo) throw new UnsupportedError('No video stream');
+  // TRUE length by counting — MediaRecorder WebM (ordinary browser output) has
+  // no container duration at all, and timestamps can be anything
+  const m = await measureOrRefuse(input, { hasAudio, hasVideo, capSec: caps.maxDurationSec, what: 'Source' });
+  const maxFrames = (caps.maxDurationSec + 1) * 30; // the output is CFR 30: a duration limit by FRAME COUNT
   // Notes for iPhone compatibility:
   // - yuv420p is mandatory (canvas-captured webm can carry alpha)
   // - CFR 30fps: MediaRecorder webm is variable-frame-rate, which iOS
@@ -234,19 +259,29 @@ app.post('/transcode-video', inPlaceEndpoint('transcode', async ({ dir, input })
     '-movflags +faststart',
     // never carry the source's metadata (a phone's location, creation time, …)
     '-map_metadata -1', '-map_chapters -1', '-fflags +bitexact', '-flags:v +bitexact',
+    // hard limits: frames by count, audio by sample count (below), bytes
+    `-frames:v ${maxFrames}`, `-fs ${caps.maxOutputBytes}`,
   ];
-  if (hasAudio) outputOptions.push('-map 0:a:0', '-c:a aac', '-b:a 192k', '-ar 48000', '-ac 2', '-flags:a +bitexact');
+  if (hasAudio) outputOptions.push('-map 0:a:0', '-c:a aac', '-b:a 192k', '-ar 48000', '-ac 2', '-flags:a +bitexact', `-af aresample=48000,atrim=end_sample=${(caps.maxDurationSec + 1) * 48000}`);
   const output = path.join(dir, 'out.mp4');
   await runFfmpeg(() => ffmpeg(input)
     .videoFilters("scale='min(1280,iw)':-2,fps=30")
     .outputOptions(outputOptions)
     .format('mp4')
     .save(output));
+  // reaching any limit means the output was cut short — refused, never uploaded
+  await refuseIfCut(output, caps.maxOutputBytes, 'Transcoded');
+  const outFrames = (await counted(() => limits.packetCounts(output, ['-map', '0:v:0'], maxFrames, FFMPEG_TIMEOUT_MS))).counts[0] || 0;
+  if (outFrames > caps.maxDurationSec * 30) throw new io.TooLargeError(`Transcoded output reached the ${caps.maxDurationSec}s limit (${outFrames} frames at 30 fps)`);
+  if (hasAudio) {
+    const outSec = await counted(() => limits.audioSeconds(output, caps.maxDurationSec + 1, FFMPEG_TIMEOUT_MS));
+    if (outSec > caps.maxDurationSec) throw new io.TooLargeError(`Transcoded output reached the ${caps.maxDurationSec}s limit (audio)`);
+  }
   await media.blankMetadataBoxes(output);
   await neutralizeSei(output, 'h264'); // x264's own settings message included
   await verifyClean(output, 'iso');
   await verifySei(output, 'h264', dir);
-  return { file: output, contentType: 'video/mp4', log: { durationSec, hasAudio } };
+  return { file: output, contentType: 'video/mp4', log: { audioSec: m.audioSec, frames: m.videoFrames, hasAudio } };
 }));
 
 // Strip every bit of metadata from an uploaded media file — video or audio,
@@ -274,8 +309,17 @@ app.post('/strip-metadata', inPlaceEndpoint('strip', async ({ dir, input, conten
     if (r.private) throw new UnsupportedError('Private data in the video stream of a non-MP4 container — refused');
   }
   if (fmt.family === 'mp3') await media.trimMp3Trailers(input); // ID3v1 / APE trailers: cut, never copied
+  // TRUE length by counting; then the remux is limited to exactly the packets
+  // counted in the input (per stream) and bytes just over the input's
+  const caps = stripCaps(await io.fileSize(input));
+  await measureOrRefuse(input, { hasAudio: fmt.audio > 0, hasVideo: fmt.video.length > 0, capSec: caps.maxDurationSec, what: 'Input' });
+  const STRIP_MAPS = ['-map', '0:V?', '-map', '0:a?'];
+  const inPackets = (await counted(() => limits.packetCounts(input, STRIP_MAPS, Infinity, FFMPEG_TIMEOUT_MS))).counts;
   const output = path.join(dir, `out.${fmt.muxer}`);
-  await media.stripMedia(input, output, fmt, FFMPEG_TIMEOUT_MS);
+  await media.stripMedia(input, output, fmt, FFMPEG_TIMEOUT_MS, { frames: inPackets, maxBytes: caps.maxOutputBytes });
+  await refuseIfCut(output, caps.maxOutputBytes, 'Stripped');
+  const outPackets = (await counted(() => limits.packetCounts(output, STRIP_MAPS, Infinity, FFMPEG_TIMEOUT_MS))).counts;
+  if (JSON.stringify(outPackets) !== JSON.stringify(inPackets)) throw new VerificationError(`output packets ${JSON.stringify(outPackets)} ≠ input ${JSON.stringify(inPackets)}`);
   if (fmt.family === 'iso') await media.blankMetadataBoxes(output);
   if (avc && fmt.family === 'iso') await neutralizeSei(output, codec);
   await verifyClean(output, fmt.family);
