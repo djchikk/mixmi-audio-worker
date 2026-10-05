@@ -1,0 +1,6 @@
+# Never send these into the build: the image installs its own dependencies
+# (the host's node_modules may be built for another OS).
+node_modules
+.git
+*.log
+.DS_Store
