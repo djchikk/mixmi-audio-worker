@@ -69,22 +69,29 @@ async function library() {
     check(`${file}: brand by probe = ${brand} → ${format}`, b === brand, String(b));
     const before = await media.metadataReport(input, 'iso');
     check(`${file}: carries metadata before (boxes ${before.leftovers.join(',')})`, !before.clean && media.locationMarkers(await readFile(input)).length > 0);
-    const out = path.join(os.tmpdir(), `wt-${Date.now()}-${file}.${format}`);
-    await media.stripVideoMetadata(input, out, format);
+    // like a job: input and output in one directory (lib/proc refuses an input outside it)
+    const jd = await mkdtemp(path.join(os.tmpdir(), 'wt-lib-'));
+    const local = path.join(jd, file);
+    await copyFile(input, local);
+    const out = path.join(jd, `out.${format}`);
+    await media.stripVideoMetadata(local, out, format);
     await media.blankMetadataBoxes(out);
     const after = await media.metadataReport(out, 'iso');
     check(`${file}: after — no metadata boxes, tags or data streams; no location bytes`, after.clean && media.locationMarkers(await readFile(out)).length === 0, JSON.stringify(after));
     check(`${file}: container kept — output brand ${brand}`, (await media.containerBrand(out)) === brand);
     check(`${file}: same streams and duration`, media.sameContent(await media.streamSummary(input), await media.streamSummary(out)));
-    await rm(out, { force: true });
+    await rm(jd, { recursive: true, force: true });
   }
   {
     // the mp4 muxer's own empty udta/meta: the verifier sees it; blanking removes it
-    const out = path.join(os.tmpdir(), `wt-${Date.now()}-muxer.mp4`);
-    await media.stripVideoMetadata(FIX('gps-video.mp4'), out, 'mp4');
+    const jd = await mkdtemp(path.join(os.tmpdir(), 'wt-lib-'));
+    const local = path.join(jd, 'in.mp4');
+    await copyFile(FIX('gps-video.mp4'), local);
+    const out = path.join(jd, 'out.mp4');
+    await media.stripVideoMetadata(local, out, 'mp4');
     const raw = await media.metadataReport(out, 'iso');
     check('verification is structural: a bare remux still has the muxer\'s udta/meta — caught', !raw.clean && raw.leftovers.includes('box:udta'), JSON.stringify(raw));
-    await rm(out, { force: true });
+    await rm(jd, { recursive: true, force: true });
   }
   {
     // a metadata box under any namespace: a ©-box with an invented name, and a uuid (XMP-style) box
@@ -529,15 +536,19 @@ async function endpoints() {
     check(`strip hard limit (-frames, a single-stream file): ${inPk} packets in, limit 7 → exactly ${sPk} out`, sPk === 7 && inPk > 7, `${sPk}/${inPk}`);
     // the OS limits (lib/proc): a run with NO -fs writes past its OS file-size limit → killed, the job's error
     const osOut = path.join(tmp, 'os-fsize.wav');
-    let osErr = null; try { await proc.run('ffmpeg', ['-nostdin', '-v', 'error', '-y', '-i', ten, '-c:a', 'pcm_s16le', osOut], { fsizeBytes: 100000, cwd: tmp }); } catch (e) { osErr = e; }
+    const { inputArgs } = require('../lib/inputs');
+    let osErr = null; try { await proc.run('ffmpeg', ['-nostdin', '-v', 'error', '-y', ...inputArgs(ten), '-c:a', 'pcm_s16le', osOut], { fsizeBytes: 100000, cwd: tmp }); } catch (e) { osErr = e; }
     const osBytes = (await stat(osOut)).size;
     check(`OS file-size limit: an ffmpeg with no -fs, writing ~880 KB under a 100000-byte limit → stopped (SIGXFSZ, OsLimitError) at ${osBytes} bytes`, osErr instanceof proc.OsLimitError && osBytes <= 100000, String(osErr));
-    let zErr = null; try { await proc.run('ffmpeg', ['-nostdin', '-v', 'error', '-y', '-i', ten, path.join(tmp, 'os-zero.wav')], { fsizeBytes: 0, cwd: tmp }); } catch (e) { zErr = e; }
+    let zErr = null; try { await proc.run('ffmpeg', ['-nostdin', '-v', 'error', '-y', ...inputArgs(ten), path.join(tmp, 'os-zero.wav')], { fsizeBytes: 0, cwd: tmp }); } catch (e) { zErr = e; }
     check('OS file-size limit 0 (probes and counting): any file write is stopped', zErr instanceof proc.OsLimitError, String(zErr));
     process.env.WORKER_CPU_LIMIT_SEC = '1';
     const t0 = Date.now();
-    let cpuErr = null; try { await proc.run('ffmpeg', ['-nostdin', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=size=1280x720:rate=30', '-t', '20', '-c:v', 'libx264', '-preset', 'veryslow', '-threads', '1', path.join(tmp, 'os-cpu.mp4')], { fsizeBytes: 1e9, cwd: tmp }); } catch (e) { cpuErr = e; } finally { delete process.env.WORKER_CPU_LIMIT_SEC; }
-    check(`OS CPU limit: a 1 s limit stops a long single-thread encode (after ${((Date.now() - t0) / 1000).toFixed(1)} s) → the run fails`, !!cpuErr && Date.now() - t0 < 15_000, String(cpuErr));
+    // a local source looped forever: only a limit ends it (the wall clock at 30 s, or — first — the CPU limit)
+    const hd = path.join(tmp, 'hd.mp4');
+    await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=1280x720:rate=30:duration=1', '-c:v', 'libx264', '-preset', 'ultrafast', hd]);
+    let cpuErr = null; try { await proc.run('ffmpeg', ['-nostdin', '-v', 'error', '-y', '-stream_loop', '-1', ...inputArgs(hd), '-c:v', 'libx264', '-preset', 'veryslow', '-threads', '1', path.join(tmp, 'os-cpu.mp4')], { fsizeBytes: 1e9, cwd: tmp, timeoutMs: 30_000 }); } catch (e) { cpuErr = e; } finally { delete process.env.WORKER_CPU_LIMIT_SEC; }
+    check(`OS CPU limit: a 1 s limit stops an endless single-thread encode (after ${((Date.now() - t0) / 1000).toFixed(1)} s, not the 30 s deadline) → the run fails`, !!cpuErr && !cpuErr.deadline && Date.now() - t0 < 15_000, String(cpuErr));
     check(`the OS file-size block unit is measured for this shell (${proc.blockUnit()} bytes)`, [512, 1024].includes(proc.blockUnit()));
   }
   {
@@ -572,6 +583,71 @@ async function endpoints() {
     check(`Annex-B expansion: a ${(size / 1024).toFixed(0)} KB HEVC MP4, ${frames} keyframes, a 240 KB user-data SEI in hvcC — repeated before every keyframe, it expands past the ${(budget / 1048576).toFixed(2)} MB OS file-size budget → 413, cleanly: nothing written, no temp dir left`,
       frames === 200 && c.r.statusCode === 413 && /expands past/.test(c.json?.error || '') && c.uploaded === null && after.length === before.length, `${frames} ${c.r.statusCode} ${c.r.body.slice(0, 140)}`);
     await rm(exp, { force: true });
+  }
+  {
+    // 1 — the COMBINED span: earliest start to latest end across all streams
+    const far = path.join(tmp, 'far-apart.webm');
+    await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'sine=duration=1', '-itsoffset', '15000', '-f', 'lavfi', '-i', 'sine=duration=1:frequency=880', '-map', '0', '-map', '1', '-c:a', 'libopus', far]);
+    const pk = await require('../lib/limits').packetCounts(far, ['-map', '0:a'], Infinity, 60_000);
+    const c = await call('/strip-metadata', fs.readFileSync(far));
+    check(`two ONE-second audio tracks, starting at 0 and 15000 s (each track's own span ${pk.spans.map((x) => x.toFixed(1)).join(' / ')} s; combined ${pk.spanSec?.toFixed(0)} s) → refused by the combined span (cap 4 h), nothing written`,
+      pk.spans.every((x) => x < 2) && pk.spanSec > 15000 && c.r.statusCode === 413 && /timestamps span 1500\d/.test(c.json?.error || '') && c.uploaded === null, `${c.r.statusCode} ${c.r.body.slice(0, 160)}`);
+  }
+  {
+    // 2 — the closed input rule: playlists and indirection lists are refused BEFORE ffmpeg runs (no process, so no network and no out-of-directory read)
+    const proc = require('../lib/proc');
+    const inputs = require('../lib/inputs');
+    const hls = Buffer.from('#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXTINF:10,\nhttp://evil.example/seg0.ts\n#EXTINF:10,\n../0xother/5f1e\n#EXTINF:10,\nfile:///etc/passwd\n#EXT-X-ENDLIST\n');
+    const ffconcat = Buffer.from("ffconcat version 1.0\nfile 'http://evil.example/a.mp3'\nfile '../0xother/5f1e'\nfile '/etc/hosts'\n");
+    const concat = Buffer.from("file 'file:///etc/passwd'\nfile 'http://evil.example/b.mp3'\n");
+    const sdp = Buffer.from('v=0\no=- 0 0 IN IP4 203.0.113.1\ns=x\nc=IN IP4 203.0.113.1\nt=0 0\nm=audio 5004 RTP/AVP 0\n');
+    const hlsBom = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), hls]); // with a byte-order mark
+    const realRun = proc.run;
+    const spawned = [];
+    proc.run = (...a) => { spawned.push(a); return realRun(...a); };
+    const results = [];
+    try {
+      for (const [name, bytes] of [['an HLS playlist (http://, another object, file:///etc/passwd)', hls], ['an HLS playlist with a BOM', hlsBom], ['an ffconcat list', ffconcat], ['a concat list', concat], ['an SDP description', sdp]]) {
+        for (const ep of ['/strip-metadata', '/transcode-video', '/enhance']) {
+          const before = spawned.length;
+          const r = await call(ep, bytes, ep === '/enhance' ? { body: { enhancementType: 'clean' } } : {});
+          results.push({ name, ep, status: r.r.statusCode, ran: spawned.length - before, uploaded: r.uploaded !== null, error: r.json?.error });
+        }
+      }
+    } finally {
+      proc.run = realRun;
+    }
+    const bad = results.filter((x) => x.status !== 415 || x.ran !== 0 || x.uploaded || !/Not an accepted media container/.test(x.error || ''));
+    check(`playlists and indirection lists (HLS ×2, ffconcat, concat, SDP) on all three endpoints → 415 "Not an accepted media container", and NO ffmpeg / ffprobe process started (${results.length} cases)`, bad.length === 0 && results.length === 15, JSON.stringify(bad.slice(0, 2)));
+    // the guard itself (lib/proc): every input shape that isn't exactly ours is refused before a process starts
+    const jd = await mkdtemp(path.join(os.tmpdir(), 'wt-guard-'));
+    const ok = path.join(jd, 'in.wav');
+    await copyFile(wav, ok);
+    const tries = [
+      ['a bare -i', ['-v', 'error', '-i', ok, '-f', 'null', '-']],
+      ['no protocol whitelist', ['-f', 'wav', '-i', ok, '-f', 'null', '-']],
+      ['-f hls', ['-protocol_whitelist', 'file', '-f', 'hls', '-i', ok, '-f', 'null', '-']],
+      ['-f concat', ['-protocol_whitelist', 'file', '-f', 'concat', '-i', ok, '-f', 'null', '-']],
+      ['a whitelist with http', ['-protocol_whitelist', 'file,http,tcp', '-f', 'wav', '-i', ok, '-f', 'null', '-']],
+      ['an http:// input', ['-protocol_whitelist', 'file', '-f', 'wav', '-i', 'http://evil.example/x.wav', '-f', 'null', '-']],
+      ['a file outside the job directory', ['-protocol_whitelist', 'file', '-f', 'wav', '-i', '/etc/hosts', '-f', 'null', '-']],
+      ['a path that climbs out', ['-protocol_whitelist', 'file', '-f', 'wav', '-i', path.join(jd, '..', 'x.wav'), '-f', 'null', '-']],
+      ['a relative path', ['-protocol_whitelist', 'file', '-f', 'wav', '-i', 'in.wav', '-f', 'null', '-']],
+      ['no input at all', ['-f', 'lavfi', 'sine', '-f', 'null', '-']],
+    ];
+    const guardBad = [];
+    for (const [label, args] of tries) {
+      let e = null; try { await proc.run('ffmpeg', args, { cwd: jd }); } catch (x) { e = x; }
+      if (!(e instanceof inputs.InputRefused)) guardBad.push(`${label}: ${e ? e.message : 'RAN'}`);
+    }
+    let pe = null; try { await proc.run('ffprobe', ['-v', 'error', '-show_format', ok], { cwd: jd }); } catch (x) { pe = x; }
+    const good = await proc.run('ffmpeg', ['-v', 'error', ...inputs.inputArgs(ok), '-f', 'null', '-'], { cwd: jd }).then(() => true, () => false);
+    check(`lib/proc refuses every input shape but ours (${tries.length} ffmpeg cases + a positional ffprobe input), and runs ours (positive control)`, guardBad.length === 0 && pe instanceof inputs.InputRefused && good, guardBad.join(' | ') + String(pe));
+    check('inputs: the allowlist is mov / mp3 / wav / flac / ogg / matroska, by magic bytes; playlist text, SDP and unknown bytes → null', ['mov', 'mp3', 'wav', 'flac', 'ogg', 'matroska'].every((f) => inputs.ALLOWED.has(f)) && inputs.ALLOWED.size === 6 && [hls, hlsBom, ffconcat, concat, sdp, Buffer.alloc(64)].every((b) => inputs.containerOf(b) === null) && inputs.containerOfFile(ok) === 'wav');
+    await rm(jd, { recursive: true, force: true });
+    // 3 — the block-size calibration runs under the same kind of limits
+    const src = await readFile(require.resolve('../lib/proc.js'), 'utf8');
+    check('the ulimit calibration child has a CPU limit (ulimit -t) and a wall-clock deadline (timeout, SIGKILL)', /ulimit -t 5 && ulimit -f 1/.test(src) && /timeout: 5000, killSignal: 'SIGKILL'/.test(src));
   }
   {
     // 1a — the scanner at EVERY offset around a chunk edge: H.264 and both HEVC SEI layouts, 3- and 4-byte start codes

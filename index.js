@@ -11,6 +11,7 @@ const sei = require('./lib/videoSei');
 const limits = require('./lib/limits');
 const proc = require('./lib/proc');
 const commands = require('./lib/commands');
+const inputs = require('./lib/inputs');
 
 // Use system FFmpeg (installed via apt in Dockerfile)
 
@@ -120,6 +121,10 @@ function inPlaceEndpoint(name, work, validate = () => null) {
         const input = path.join(dir, 'in');
         const got = await io.downloadToFile(sourceUrl, input, { maxBytes: MAX_INPUT_BYTES, deadlineMs: DOWNLOAD_DEADLINE_MS });
         app.log.info({ jobId, ref, endpoint: name, bytes: got.bytes }, 'Downloaded');
+        // the closed input rule (lib/inputs): an allowlisted container by its
+        // magic bytes, or refused before ffmpeg ever runs (playlists, concat
+        // lists, SDP and every other indirection format included)
+        if (!inputs.containerOfFile(input)) throw new inputs.InputRefused('Not an accepted media container');
         const out = await work({ jobId, ref, dir, input, contentType: got.contentType, body: request.body || {} });
         const up = await io.uploadFile(uploadUrl, out.file, out.contentType, { deadlineMs: UPLOAD_DEADLINE_MS });
         app.log.info({ jobId, ref, endpoint: name, bytes: up.bytes, ...out.log }, 'Written back in place');
@@ -131,7 +136,7 @@ function inPlaceEndpoint(name, work, validate = () => null) {
     } catch (error) {
       // an OS file-size limit (lib/proc), or the Annex-B budget, is a size refusal
       const tooLarge = error instanceof io.TooLargeError || error instanceof proc.OsLimitError || error instanceof sei.SeiLimitError;
-      const status = tooLarge ? 413 : error instanceof UnsupportedError ? 415 : error instanceof io.DeadlineError || error.deadline ? 504 : 500;
+      const status = tooLarge ? 413 : error instanceof UnsupportedError || error instanceof inputs.InputRefused ? 415 : error instanceof io.DeadlineError || error.deadline ? 504 : 500;
       app.log.error({ jobId, ref, endpoint: name, error: scrub(error.message) }, 'Job failed');
       return reply.status(status).send({ error: scrub(error.message) });
     }
