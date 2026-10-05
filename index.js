@@ -3,6 +3,7 @@ const cors = require('@fastify/cors');
 const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const crypto = require('crypto');
+const { execFile } = require('child_process');
 // Through the module object (not destructured): the endpoint tests swap a
 // step out to prove the output verification is what refuses a dirty file.
 const media = require('./lib/stripMedia');
@@ -142,10 +143,31 @@ async function verifyClean(file, kind) {
   }
 }
 
-/** The picture stream must carry no private user data (any type-5 SEI off the allowlist). */
+/**
+ * Seconds of audio actually decoded from the first audio stream, decoding at
+ * most `limitSec` (ffmpeg -t). Never the container's declared duration.
+ */
+function measureAudioSeconds(input, limitSec, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    execFile('ffmpeg', ['-nostdin', '-v', 'error', '-i', input, '-map', '0:a:0', '-t', String(limitSec), '-f', 'null', '-', '-progress', 'pipe:1', '-nostats'], { timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024 }, (err, stdout) => {
+      if (err) return reject(err.killed ? new io.DeadlineError('measuring the audio timed out') : new UnsupportedError('The audio could not be decoded'));
+      const us = [...String(stdout).matchAll(/^out_time_us=(\d+)/gm)].map((m) => Number(m[1]));
+      if (!us.length || !/progress=end/.test(stdout)) return reject(new UnsupportedError('The audio could not be measured'));
+      resolve(Math.max(...us) / 1e6);
+    });
+  });
+}
+
+/** Neutralize private SEI in place; refuse when it shares a NAL with picture-relevant SEI. */
+async function neutralizeSei(file, codec) {
+  const r = await sei.neutralizeSeiInIso(file, codec);
+  if (r.refused) throw new UnsupportedError(`Video stream: ${r.refused} — refused`);
+}
+
+/** The picture stream must carry no private SEI at all (an independent re-scan, parameter sets included). */
 async function verifySei(file, codec, dir) {
   const r = await sei.seiReport(file, codec, dir, PROBE_DEADLINE_MS * 2);
-  if (r && r.disallowed > 0) throw new VerificationError(`private user data survived in the video stream (${r.disallowed} SEI payloads)`);
+  if (r && (r.private > 0 || r.refuseNals > 0)) throw new VerificationError(`private data survived in the video stream (${r.private} SEI messages)`);
 }
 
 // Enhance: an audio file → enhanced WAV, written back in place. mixmi then
@@ -162,10 +184,11 @@ app.post('/enhance', inPlaceEndpoint('enhance', async ({ dir, input, body }) => 
     throw new UnsupportedError('Not audio ffmpeg can read');
   }
   if (!(probe.streams || []).some((st) => st.codec_type === 'audio')) throw new UnsupportedError('No audio stream');
-  // a declared duration over the cap is refused before any work; an unknown one
-  // (e.g. MediaRecorder webm) is bounded by the output cap below
-  const durationSec = Number(probe.format?.duration) || 0;
-  if (durationSec > caps.maxDurationSec) throw new io.TooLargeError(`Input exceeds the ${caps.maxDurationSec}s enhancement cap`);
+  // The container's declared duration is never trusted (it can be missing or
+  // wrong): the audio is DECODED to measure it — bounded at the cap + 1 s, so a
+  // very long file costs at most the cap's worth of decoding.
+  const measured = await measureAudioSeconds(input, caps.maxDurationSec + 1, FFMPEG_TIMEOUT_MS);
+  if (measured > caps.maxDurationSec) throw new io.TooLargeError(`Input exceeds the ${caps.maxDurationSec}s enhancement cap (measured)`);
   const output = path.join(dir, 'out.wav');
   await runFfmpeg(() => ffmpeg(input)
     .audioFilters(filterChain)
@@ -178,7 +201,8 @@ app.post('/enhance', inPlaceEndpoint('enhance', async ({ dir, input, body }) => 
     .format('wav')
     .save(output));
   // reaching the cap means the output was cut short — refused, never uploaded
-  if ((await io.fileSize(output)) >= caps.maxOutputBytes) throw new io.TooLargeError(`Enhanced output exceeds the ${caps.maxOutputBytes}-byte cap`);
+  const written = await io.fileSize(output);
+  if (written >= caps.maxOutputBytes) throw new io.TooLargeError(`Enhanced output exceeds the ${caps.maxOutputBytes}-byte cap (stopped at ${written} bytes)`);
   await verifyClean(output, 'wav');
   return { file: output, contentType: 'audio/wav', log: { enhancementType } };
 }, (body) => (ENHANCEMENT_FILTERS[body.enhancementType || 'auto'] ? null : 'Invalid enhancementType')));
@@ -219,6 +243,7 @@ app.post('/transcode-video', inPlaceEndpoint('transcode', async ({ dir, input })
     .format('mp4')
     .save(output));
   await media.blankMetadataBoxes(output);
+  await neutralizeSei(output, 'h264'); // x264's own settings message included
   await verifyClean(output, 'iso');
   await verifySei(output, 'h264', dir);
   return { file: output, contentType: 'video/mp4', log: { durationSec, hasAudio } };
@@ -239,20 +264,22 @@ app.post('/strip-metadata', inPlaceEndpoint('strip', async ({ dir, input, conten
   // Motion-JPEG frames can each carry EXIF, so other codecs are refused.)
   if (fmt.video.some((c) => !media.VIDEO_CODECS.has(c))) throw new UnsupportedError(`Video codec not accepted: ${fmt.video.join(', ')}`);
   if (fmt.video.length > 1) throw new UnsupportedError('More than one picture track');
-  // H.264 / HEVC: private user data in SEI is dropped, or the file refused (lib/videoSei)
+  // H.264 / HEVC: private SEI (lib/videoSei) — neutralized in place after the
+  // remux (MP4 / MOV), or the file refused
   const codec = fmt.video[0];
-  let videoBsf;
-  if (codec === 'h264' || codec === 'hevc') {
-    const decision = sei.seiDecision(await sei.seiReport(input, codec, dir, PROBE_DEADLINE_MS * 2));
-    if (decision === 'refuse') throw new UnsupportedError('Private user data in the video stream alongside picture metadata — refused');
-    if (decision === 'drop-sei') videoBsf = sei.dropSeiFilter(codec);
+  const avc = codec === 'h264' || codec === 'hevc';
+  if (avc && fmt.family !== 'iso') {
+    // no in-place editing outside MP4 / MOV: private SEI there is refused
+    const r = await sei.seiReport(input, codec, dir, PROBE_DEADLINE_MS * 2);
+    if (r.private) throw new UnsupportedError('Private data in the video stream of a non-MP4 container — refused');
   }
   if (fmt.family === 'mp3') await media.trimMp3Trailers(input); // ID3v1 / APE trailers: cut, never copied
   const output = path.join(dir, `out.${fmt.muxer}`);
-  await media.stripMedia(input, output, fmt, FFMPEG_TIMEOUT_MS, { videoBsf });
+  await media.stripMedia(input, output, fmt, FFMPEG_TIMEOUT_MS);
   if (fmt.family === 'iso') await media.blankMetadataBoxes(output);
+  if (avc && fmt.family === 'iso') await neutralizeSei(output, codec);
   await verifyClean(output, fmt.family);
-  if (codec === 'h264' || codec === 'hevc') await verifySei(output, codec, dir);
+  if (avc) await verifySei(output, codec, dir);
   // Same real picture and sound streams, same duration — before anything is written back
   const [inSum, outSum] = await Promise.all([media.streamSummary(input, PROBE_DEADLINE_MS), media.streamSummary(output, PROBE_DEADLINE_MS)]);
   if (!media.sameContent(inSum, outSum)) {

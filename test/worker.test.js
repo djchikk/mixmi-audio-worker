@@ -269,7 +269,9 @@ async function endpoints() {
     const c = await call('/strip-metadata', dirty);
     const after = c.uploaded && await (async () => { const o = await writeTmp(c.uploaded, '.ogg'); const r = await media.metadataReport(o, 'ogg'); await rm(o, { force: true }); return r; })();
     check('Vorbis-comment vendor off the allowlist: flagged before; 200 — the remux writes the fixed vendor; the free text is gone; PCM identical', before.leftovers.includes('ogg-vendor') && c.r.statusCode === 200 && after?.clean && !c.uploaded.includes(Buffer.from('Fixtureville')) && (await samePcm(df, c.uploaded)), `${JSON.stringify(before.leftovers)} ${c.r.statusCode} ${JSON.stringify(after)}`);
-    check('the vendor allowlist: encoder identities pass, free text does not', media.vendorOk('ffmpeg') && media.vendorOk('Xiph.Org libVorbis I 20200704 (Reducing Environment)') && media.vendorOk('libopus 1.5.2') && media.vendorOk('Lavf61.7.100') && !media.vendorOk('GPS 0.5 0.5') && !media.vendorOk('Xiph.Org libVorbis I 20200704 (lat 51.5)') && !media.vendorOk(''));
+    check('vendor identities are EXACT and anchored — known encoders pass; anything appended, or free text, does not',
+      ['ffmpeg', 'Xiph.Org libVorbis I 20200704 (Reducing Environment)', 'Xiph.Org libVorbis I 20200704', 'libopus 1.5.2', 'libopus 1.4', 'Lavf61.7.100', 'Lavc62.28.100 vorbis', 'reference libFLAC 1.4.3 20230623'].every(media.vendorOk)
+        && !['GPS 0.5 0.5', 'Xiph.Org libVorbis I 20200704 (lat 51.5)', 'libopus 1.5.2 GPS', 'libopus 1.5.2-gps', 'Lavf61.7.100 x', 'ffmpeg ', ' ffmpeg', 'Lavc62.28.100 vorbis GPS', ''].some(media.vendorOk));
   }
   {
     // WebM with Vorbis: the comment header lives in CodecPrivate, which a remux copies untouched
@@ -298,7 +300,7 @@ async function endpoints() {
     check('a Matroska attachment (a GPS photo): present before; 200, dropped (no attachment, no EXIF bytes); PCM identical', before.leftovers.includes('mkv-attachments') && before.otherStreams > 0 && c.r.statusCode === 200 && after?.clean && !c.uploaded.includes(Buffer.from('Exif\0\0', 'latin1')) && (await samePcm(mk, c.uploaded)), `${JSON.stringify(before)} ${c.r.statusCode} ${JSON.stringify(after)}`);
   }
   {
-    // H.264 user_data_unregistered SEI
+    // H.264 / HEVC SEI (Astra's 2nd round): every type-5 message goes; per NAL
     const plain = path.join(tmp, 'sei-plain.mp4'), ud = path.join(tmp, 'sei-ud.mp4'), orient = path.join(tmp, 'sei-orient.mp4'), hevc = path.join(tmp, 'sei.hevc.mp4');
     await sh('ffmpeg', ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc=duration=2:size=128x96:rate=10', '-f', 'lavfi', '-i', 'sine=duration=2', '-shortest', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', plain]);
     await sh('ffmpeg', ['-y', '-v', 'error', '-i', plain, '-c', 'copy', '-bsf:v', 'h264_metadata=sei_user_data=086f3693-b7b3-4f2c-9653-21492feee5b8+GPS 0.5 0.5 Fixtureville', ud]);
@@ -308,35 +310,72 @@ async function endpoints() {
     const c = await call('/strip-metadata', await readFile(ud));
     const out = c.uploaded && await writeTmp(c.uploaded, '.mp4');
     const outSei = out && await sei.seiReport(out, 'h264', tmp);
-    check('H.264 user-data SEI ("GPS … Fixtureville"): found before; 200, gone from the bitstream (re-scan: no private payload), picture frames and PCM IDENTICAL',
-      inUd.disallowed === 1 && c.r.statusCode === 200 && outSei?.disallowed === 0 && !c.uploaded.includes(Buffer.from('Fixtureville')) && (await frameHash(ud)) === (await frameHash(out)) && (await pcmHash(ud)) === (await pcmHash(out)),
+    check('H.264 user-data SEI ("GPS … Fixtureville" + x264\'s settings): found before; 200, NEUTRALIZED in place — the re-scan finds no private message; frames and PCM IDENTICAL',
+      inUd.private === 2 && c.r.statusCode === 200 && outSei?.private === 0 && !c.uploaded.includes(Buffer.from('Fixtureville')) && !c.uploaded.includes(Buffer.from('x264 - core')) && (await frameHash(ud)) === (await frameHash(out)) && (await pcmHash(ud)) === (await pcmHash(out)),
       `${JSON.stringify(inUd)} ${c.r.statusCode} ${c.r.body.slice(0, 100)} ${JSON.stringify(outSei)}`);
     if (out) await rm(out, { force: true });
     const cp = await call('/strip-metadata', await readFile(plain));
     const pOut = cp.uploaded && await writeTmp(cp.uploaded, '.mp4');
-    check('only the allowlisted x264 settings SEI: kept as it is (no SEI dropped), 200', cp.r.statusCode === 200 && (await sei.seiReport(pOut, 'h264', tmp)).allowed === 1 && (await frameHash(plain)) === (await frameHash(pOut)));
+    check('x264\'s own settings string is removed too (no allowlist): 200, no private message left, frames identical', cp.r.statusCode === 200 && (await sei.seiReport(pOut, 'h264', tmp)).private === 0 && !cp.uploaded.includes(Buffer.from('x264 - core')) && (await frameHash(plain)) === (await frameHash(pOut)), `${cp.r.statusCode} ${cp.r.body.slice(0, 100)}`);
     if (pOut) await rm(pOut, { force: true });
-    // the output SEI scan is what stops a miss: sabotage the drop filter into a no-op
-    const realDrop = sei.dropSeiFilter;
-    sei.dropSeiFilter = () => 'null';
+    // the independent output re-scan is what stops a miss: sabotage the neutralizer into a no-op
+    const realNeutralize = sei.neutralizeSeiInIso;
+    sei.neutralizeSeiInIso = async () => ({ neutralized: 0, refused: null });
     let sab;
-    try { sab = await call('/strip-metadata', await readFile(ud)); } finally { sei.dropSeiFilter = realDrop; }
-    check('with the SEI drop sabotaged, the OUTPUT bitstream scan refuses: 500 "private user data survived", nothing written (fails if verifySei is removed)', sab.r.statusCode === 500 && sab.uploaded === null && /private user data survived/.test(sab.json?.error || ''), `${sab.r.statusCode} ${sab.r.body.slice(0, 120)}`);
+    try { sab = await call('/strip-metadata', await readFile(ud)); } finally { sei.neutralizeSeiInIso = realNeutralize; }
+    check('with the neutralizer sabotaged, the OUTPUT re-scan refuses: 500 "private data survived", nothing written (fails if verifySei is removed)', sab.r.statusCode === 500 && sab.uploaded === null && /private data survived/.test(sab.json?.error || ''), `${sab.r.statusCode} ${sab.r.body.slice(0, 120)}`);
     const co = await call('/strip-metadata', await readFile(orient));
-    check('private user data BESIDE picture-relevant SEI (display orientation) → REFUSED (415), nothing written', co.r.statusCode === 415 && co.uploaded === null, `${co.r.statusCode} ${co.r.body.slice(0, 120)}`);
+    check('private data in the SAME SEI NAL as picture-relevant SEI (display orientation) → REFUSED (415), nothing written', co.r.statusCode === 415 && co.uploaded === null, `${co.r.statusCode} ${co.r.body.slice(0, 120)}`);
     const ch = await call('/strip-metadata', await readFile(hevc));
-    check('HEVC with only x265\'s allowlisted settings SEI: 200', ch.r.statusCode === 200, `${ch.r.statusCode} ${ch.r.body.slice(0, 120)}`);
+    const hOut = ch.uploaded && await writeTmp(ch.uploaded, '.mp4');
+    check('HEVC (x265 writes its own settings SEI): 200, no private message left, frames identical', ch.r.statusCode === 200 && (await sei.seiReport(hOut, 'hevc', tmp)).private === 0 && (await frameHash(hevc)) === (await frameHash(hOut)), `${ch.r.statusCode} ${ch.r.body.slice(0, 120)}`);
+    if (hOut) await rm(hOut, { force: true });
+    // T.35 (type 4), end to end: the injected payload's type byte 5 → 4 (a T.35 payload that is NOT HDR10+)
+    const udBuf = Buffer.from(await readFile(ud));
+    const uuidAt = udBuf.indexOf(Buffer.from('086f3693b7b34f2c965321492feee5b8', 'hex'));
+    if (uuidAt < 2 || udBuf[uuidAt - 2] !== 5) throw new Error('fixture: payload type byte not where expected');
+    udBuf[uuidAt - 2] = 4;
+    const t35 = await writeTmp(udBuf, '.mp4');
+    const t35In = await sei.seiReport(t35, 'h264', tmp);
+    const ct = await call('/strip-metadata', udBuf);
+    const tOut = ct.uploaded && await writeTmp(ct.uploaded, '.mp4');
+    check('a T.35 (type 4) payload that is not HDR10+: counted private; 200, neutralized; no private message left', t35In.types['4'] === 1 && t35In.private === 2 && ct.r.statusCode === 200 && (await sei.seiReport(tOut, 'h264', tmp)).private === 0 && !ct.uploaded.includes(Buffer.from('Fixtureville')), `${JSON.stringify(t35In)} ${ct.r.statusCode} ${ct.r.body.slice(0, 100)}`);
+    if (tOut) await rm(tOut, { force: true });
   }
   {
-    // the scanner across chunk boundaries: SEI NALs straddling the 1 MB reads
-    const sc = (b) => Buffer.from([0, 0, 0, 1, ...b]);
-    const udSei = (text) => { const payload = Buffer.concat([Buffer.from('086f3693b7b34f2c965321492feee5b8', 'hex'), Buffer.from(text)]); return sc([0x06, 5, payload.length, ...payload, 0x80]); };
-    const filler = (n) => sc([0x0c, ...Buffer.alloc(n, 0xff)]); // filler NAL (type 12)
-    const parts = [filler((1 << 20) - 30), udSei('GPS 1'), filler((1 << 20) - 10), udSei('GPS 2'), filler(5000), udSei('GPS 3')];
-    const es = await writeTmp(Buffer.concat(parts), '.h264');
-    const r = await sei.scanAnnexB(es, 'h264');
-    check('SEI scan: payloads straddling the 1 MB chunk boundaries are all found (3)', r.disallowed === 3, JSON.stringify({ types: Object.fromEntries(r.types), disallowed: r.disallowed }));
-    await rm(es, { force: true });
+    // the per-NAL policy, by structure (unit level): HDR10+ kept; captions / other T.35 private; sharing → refused
+    const sei1 = (msgs) => { const parts = [Buffer.from([0x06])]; for (const [t, p] of msgs) parts.push(Buffer.from([t, p.length]), p); parts.push(Buffer.from([0x80])); return Buffer.concat(parts); };
+    const hdr10p = Buffer.from([0xb5, 0x00, 0x3c, 0x00, 0x01, 0x04, 0x01, 0x40, 0x00, 0x0c]);
+    const captions = Buffer.concat([Buffer.from([0xb5, 0x00, 0x31]), Buffer.from('GA94'), Buffer.from([0x03, 0x40, 0x00])]);
+    const ud5 = Buffer.concat([Buffer.alloc(16, 7), Buffer.from('GPS')]);
+    const v = (msgs) => sei.nalVerdict(sei1(msgs), 'h264').verdict;
+    check('per NAL: HDR10+ alone → keep · captions (T.35 GA94) → neutralize · user data + buffering/timing → neutralize · user data + HDR10+ → REFUSE · captions + mastering display (137) → REFUSE · timing alone → keep',
+      v([[4, hdr10p]]) === 'keep' && v([[4, captions]]) === 'neutralize' && v([[5, ud5], [0, Buffer.from([0x80])], [1, Buffer.from([0x10])]]) === 'neutralize' && v([[5, ud5], [4, hdr10p]]) === 'refuse' && v([[4, captions], [137, Buffer.alloc(24)]]) === 'refuse' && v([[1, Buffer.from([0x10])]]) === 'keep');
+    check('HDR10+ is identified by its exact T.35 header (country B5, provider 003C, oriented 0001, app 4, version ≤ 1)', sei.isHdr10Plus(hdr10p) && !sei.isHdr10Plus(Buffer.from([0xb5, 0x00, 0x3c, 0x00, 0x01, 0x05, 0x01])) && !sei.isHdr10Plus(captions) && !sei.isHdr10Plus(Buffer.from([0xb5])));
+  }
+  {
+    // 1a — the scanner at EVERY offset around a chunk edge: H.264 and both HEVC SEI layouts, 3- and 4-byte start codes
+    const CH = 64;
+    const layouts = [['h264', [0x06], [0x0c]], ['hevc', [39 << 1, 0x01], [38 << 1, 0x01]], ['hevc', [40 << 1, 0x01], [38 << 1, 0x01]]];
+    let cases = 0; const misses = [];
+    for (const [codec, seiHdr, fillHdr] of layouts) {
+      for (const sc of [[0, 0, 1], [0, 0, 0, 1]]) {
+        const payload = Buffer.concat([Buffer.alloc(16, 9), Buffer.from('GPS')]);
+        const seiNal = Buffer.concat([Buffer.from(sc), Buffer.from(seiHdr), Buffer.from([5, payload.length]), payload, Buffer.from([0x80])]);
+        for (let k = CH - 16; k <= 2 * CH + 16; k++) {
+          // a filler NAL of exactly k bytes, so the SEI's start code begins at offset k; then the SEI; then (half the time) another filler
+          const filler = Buffer.concat([Buffer.from(sc), Buffer.from(fillHdr), Buffer.alloc(Math.max(1, k - sc.length - fillHdr.length - 1), 0xff), Buffer.from([0x80])]).subarray(0, k);
+          if (filler.length !== k) continue;
+          const tail = k % 2 ? Buffer.concat([Buffer.from(sc), Buffer.from(fillHdr), Buffer.alloc(30, 0xff), Buffer.from([0x80])]) : Buffer.alloc(0);
+          const es = await writeTmp(Buffer.concat([filler, seiNal, tail]), '.es');
+          const r = await sei.scanAnnexB(es, codec, CH);
+          cases++;
+          if (r.private !== 1 || r.seiNals !== 1) misses.push(`${codec}/${seiHdr[0]}/sc${sc.length}/k${k}: ${JSON.stringify(r)}`);
+          await rm(es, { force: true });
+        }
+      }
+    }
+    check(`SEI scan finds the private message at every offset around 64-byte chunk edges (${cases} cases: H.264, HEVC prefix + suffix, 3- and 4-byte start codes)`, misses.length === 0 && cases > 400, misses.slice(0, 3).join(' | '));
   }
   {
     // data and subtitle tracks (timecode data track, mov_text subtitles) beside the picture
@@ -365,13 +404,45 @@ async function endpoints() {
     process.env.ENHANCE_MAX_DURATION_SEC = '5';
     const d = await call('/enhance', await readFile(long), { body: { enhancementType: 'clean' } });
     delete process.env.ENHANCE_MAX_DURATION_SEC;
-    check('enhance: a 10 s input with a 5 s cap → 413 before any processing, nothing written', d.r.statusCode === 413 && d.uploaded === null, `${d.r.statusCode} ${d.r.body.slice(0, 100)}`);
-    process.env.ENHANCE_MAX_OUTPUT_BYTES = '100000';
-    const o = await call('/enhance', await readFile(short), { body: { enhancementType: 'clean' } });
+    check('enhance: a 10 s input with a 5 s cap → 413 (measured) before any processing, nothing written', d.r.statusCode === 413 && /measured/.test(d.json?.error || '') && d.uploaded === null, `${d.r.statusCode} ${d.r.body.slice(0, 100)}`);
+    // a container that declares NO duration (live WebM, like MediaRecorder's): measured, not trusted
+    const live = path.join(tmp, 'live.webm');
+    await sh('ffmpeg', ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'sine=duration=10', '-c:a', 'libopus', '-live', '1', '-f', 'webm', live]);
+    const declared = JSON.parse(await sh('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'json', live])).format?.duration;
+    process.env.ENHANCE_MAX_DURATION_SEC = '5';
+    const lv = await call('/enhance', await readFile(live), { body: { enhancementType: 'clean' } });
+    delete process.env.ENHANCE_MAX_DURATION_SEC;
+    check(`enhance: 10 s of audio whose container declares ${declared === undefined ? 'NO' : declared + ' s of'} duration → MEASURED, 413 (measured), nothing written`, (declared === undefined || declared === 'N/A') && lv.r.statusCode === 413 && /measured/.test(lv.json?.error || '') && lv.uploaded === null, `${declared} ${lv.r.statusCode} ${lv.r.body.slice(0, 100)}`);
+    // 30 s → ~2.9 MB of WAV; cap 1 MB. (Longer than loudnorm's 3 s look-ahead, so output streams and -fs can act.)
+    const thirty = path.join(tmp, 'thirty.mp3');
+    await sh('ffmpeg', ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'sine=duration=30', '-c:a', 'libmp3lame', '-b:a', '8k', thirty]);
+    process.env.ENHANCE_MAX_OUTPUT_BYTES = '1000000';
+    const o = await call('/enhance', await readFile(thirty), { body: { enhancementType: 'clean' } });
     delete process.env.ENHANCE_MAX_OUTPUT_BYTES;
-    check('enhance: an output over the byte cap (3 s → ~290 KB, cap 100 KB) → 413, cut off by -fs, nothing written', o.r.statusCode === 413 && o.uploaded === null, `${o.r.statusCode} ${o.r.body.slice(0, 100)}`);
+    const stopped = Number(/stopped at (\d+) bytes/.exec(o.json?.error || '')?.[1]);
+    check(`enhance: an output over the byte cap (30 s → ~2.9 MB, cap 1 MB) → 413, and ffmpeg's -fs STOPPED writing at ${stopped} bytes (≤ cap + 64 KB — without -fs it would be ~2.9 MB), nothing written`, o.r.statusCode === 413 && o.uploaded === null && stopped >= 1000000 && stopped <= 1000000 + 65536, `${o.r.statusCode} ${o.r.body.slice(0, 120)}`);
     const ok = await call('/enhance', await readFile(short), { body: { enhancementType: 'clean' } });
     check('enhance within the caps: 200, and the upload is STREAMED (a ReadableStream body, duplex half, exact Content-Length)', ok.r.statusCode === 200 && ok.uploadInit?.duplex === 'half' && !Buffer.isBuffer(ok.uploadInit?.body) && typeof ok.uploadInit?.body?.getReader === 'function' && Number(ok.uploadHeaders?.['Content-Length']) === ok.uploaded?.length, `${ok.r.statusCode} ${JSON.stringify(ok.uploadHeaders)}`);
+  }
+  {
+    // 1b — backpressure in BYTES: a slow consumer; the file is read at most ~2 chunks ahead of what was consumed
+    const f = path.join(tmp, 'bp.bin');
+    await writeFile(f, crypto.randomBytes(4 << 20));
+    const { stream, bytesRead } = io.fileStream(f, 64 * 1024);
+    const reader = stream.getReader();
+    let consumed = 0, worstAhead = 0, n = 0;
+    const want = await readFile(f), got = [];
+    for (;;) {
+      await new Promise((r) => setTimeout(r, n++ < 20 ? 15 : 0)); // slow for the first 20 reads
+      worstAhead = Math.max(worstAhead, bytesRead() - consumed);
+      const { done, value } = await reader.read();
+      if (done) break;
+      consumed += value.length; got.push(Buffer.from(value));
+    }
+    check(`backpressure in bytes: a slow consumer never lets reading run more than 2 chunks ahead (worst ${(worstAhead / 1024).toFixed(0)} KB), and every byte arrives intact`, worstAhead <= 2 * 64 * 1024 && Buffer.concat(got).equals(want), `${worstAhead}`);
+    const src = await readFile(require.resolve('../lib/storageIO.js'), 'utf8');
+    check('uploads use that stream (no Readable.toWeb, which queues by chunk count)', /const body = fileStream\(file\)\.stream/.test(src) && !/toWeb\(/.test(src));
+    await rm(f, { force: true });
   }
   {
     // memory: a 256 MB upload streamed from disk does not land in memory
