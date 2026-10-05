@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js",
-    "test": "node test/worker.test.js"
+    "test": "node --expose-gc test/worker.test.js"
   },
   "dependencies": {
     "@fastify/cors": "^9.0.1",

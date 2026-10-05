@@ -18,6 +18,26 @@ const check = (label, ok, detail = '') => { if (ok) { pass++; console.log(`  ✓
 const FIX = (f) => path.join(__dirname, 'fixtures', f);
 // ffmpeg never waits on stdin (an existing output file would otherwise prompt and hang)
 const sh = (cmd, args) => new Promise((res, rej) => execFile(cmd, cmd === 'ffmpeg' ? ['-nostdin', '-y', ...args] : args, { timeout: 120_000 }, (e, so, se) => (e ? rej(new Error(se || e.message)) : res(so))));
+const crypto = require('crypto');
+const sei = require('../lib/videoSei');
+/** Decoded audio (first audio stream → s16le PCM), hashed: proves the SOUND is unchanged, not just stream counts. */
+const pcmHash = async (file) => { const out = `${file}.pcm`; await sh('ffmpeg', ['-v', 'error', '-i', file, '-map', '0:a:0', '-f', 's16le', '-c:a', 'pcm_s16le', out]); const h = crypto.createHash('sha256').update(await readFile(out)).digest('hex'); await rm(out, { force: true }); return h; };
+/** Decoded video frames, hashed (framemd5 of the first picture stream). */
+const frameHash = async (file) => { const out = `${file}.fmd5`; await sh('ffmpeg', ['-v', 'error', '-i', file, '-map', '0:V:0', '-f', 'framemd5', out]); const t = (await readFile(out, 'utf8')).split('\n').filter((l) => l && !l.startsWith('#')).map((l) => l.split(',').pop().trim()).join(','); await rm(out, { force: true }); return crypto.createHash('sha256').update(t).digest('hex'); };
+/** Recompute every Ogg page CRC in place (poly 0x04c11db7, no reflection). */
+function oggFixCrcs(b) {
+  const table = Array.from({ length: 256 }, (_, i) => { let r = i << 24; for (let k = 0; k < 8; k++) r = r & 0x80000000 ? ((r << 1) ^ 0x04c11db7) >>> 0 : (r << 1) >>> 0; return r >>> 0; });
+  let o = 0;
+  while (o + 27 <= b.length && b.subarray(o, o + 4).toString('latin1') === 'OggS') {
+    const nseg = b[o + 26];
+    const len = 27 + nseg + [...b.subarray(o + 27, o + 27 + nseg)].reduce((a, x) => a + x, 0);
+    b.writeUInt32LE(0, o + 22);
+    let crc = 0;
+    for (let i = o; i < o + len; i++) crc = ((crc << 8) ^ table[((crc >>> 24) ^ b[i]) & 0xff]) >>> 0;
+    b.writeUInt32LE(crc, o + 22);
+    o += len;
+  }
+}
 const jobDirs = async () => (await readdir(os.tmpdir())).filter((d) => d.startsWith('mixmi-job-'));
 
 const HOST = 'abc.supabase.co';
@@ -141,12 +161,12 @@ async function endpoints() {
 
   // POST with the source served from `src` (bytes, or a Response factory) → { r, json, uploaded, logs }
   const call = async (endpoint, src, opts = {}) => {
-    let uploaded = null, uploadHeaders = null;
+    let uploaded = null, uploadHeaders = null, uploadInit = null;
     global.fetch = async (url, o = {}) => {
       if (o.redirect !== 'manual') throw new Error('a request without redirect: manual');
       const u = String(url);
       if (u.startsWith(`${S}/sign/`)) return typeof src === 'function' ? src() : new Response(src, { status: 200, headers: { 'content-length': String(src.length), 'content-type': opts.type || 'application/octet-stream' } });
-      if (u.startsWith(`${S}/upload/sign/`)) { uploaded = Buffer.from(o.body); uploadHeaders = o.headers; return opts.upload ? opts.upload() : new Response('{"Key":"x"}', { status: 200 }); }
+      if (u.startsWith(`${S}/upload/sign/`)) { uploaded = Buffer.from(await new Response(o.body).arrayBuffer()); uploadHeaders = o.headers; uploadInit = o; return opts.upload ? opts.upload() : new Response('{"Key":"x"}', { status: 200 }); }
       throw new Error(`unexpected fetch ${u}`);
     };
     // everything the worker logs, as it logs it (pino writes asynchronously, so capture at app.log)
@@ -157,7 +177,7 @@ async function endpoints() {
     try {
       const r = await app.inject({ method: 'POST', url: endpoint, headers: H, payload: { sourceUrl: opts.sourceUrl || readUrl(), uploadUrl: opts.uploadUrl || upUrl(), ...(opts.body || {}) } });
       let json = null; try { json = JSON.parse(r.body); } catch { /* */ }
-      return { r, json, uploaded, uploadHeaders, logs: logs.join('') };
+      return { r, json, uploaded, uploadHeaders, uploadInit, logs: logs.join('') };
     } finally {
       app.log.info = realInfo;
       app.log.error = realError;
@@ -198,12 +218,184 @@ async function endpoints() {
       const c = await call('/strip-metadata', src);
       const rep = c.uploaded && await writtenReport(c.uploaded, family);
       const sum = c.uploaded && await (async () => { const f = path.join(tmp, `s-${Date.now()}`); await writeFile(f, c.uploaded); const r = await media.streamSummary(f); await rm(f, { force: true }); return r; })();
-      check(`audio — ${label}: dirty before, 200 (exact shape), written back clean: no tags, no picture, no EXIF/GPS bytes, sound kept`,
+      check(`audio — ${label}: dirty before, 200 (exact shape), written back clean: no tags, no picture, no EXIF/GPS bytes; decoded PCM IDENTICAL`,
         !before.clean && src.includes(Buffer.from('Fixtureville')) && c.r.statusCode === 200 && exact(c.json) && rep?.clean
           && !c.uploaded.includes(Buffer.from('Fixtureville')) && !c.uploaded.includes(Buffer.from('GPS 0.5')) && !c.uploaded.includes(Buffer.from('Exif\0\0', 'latin1'))
-          && sum?.audio === 1 && sum?.video === 0,
+          && sum?.audio === 1 && sum?.video === 0
+          && (await pcmHash(file)) === (await (async () => { const f = path.join(tmp, `pcm-${Date.now()}`); await writeFile(f, c.uploaded); const h = await pcmHash(f); await rm(f, { force: true }); return h; })()),
         `${c.r.statusCode} ${c.r.body.slice(0, 140)} before=${JSON.stringify(before)} after=${JSON.stringify(rep)} streams=${JSON.stringify(sum)}`);
     }
+  }
+  // ── Astra's 2nd HOLD on worker #3: independent cases ──────────────────────
+  const writeTmp = async (buf, ext = '') => { const f = path.join(tmp, `u-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`); await writeFile(f, buf); return f; };
+  const samePcm = async (inFile, outBuf) => { const f = await writeTmp(outBuf); const ok = (await pcmHash(inFile)) === (await pcmHash(f)); await rm(f, { force: true }); return ok; };
+  const tone = ['-nostdin', '-y', '-v', 'error', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=2'];
+  {
+    // ffmpeg writes ID3v1 only beside ID3v2: write both, then cut the ID3v2 tag off
+    const both = path.join(tmp, 'id3both.mp3'), f = path.join(tmp, 'id3v1.mp3');
+    await sh('ffmpeg', [...tone, '-c:a', 'libmp3lame', '-write_id3v1', '1', '-metadata', 'title=Fixtureville', both]);
+    const b0 = await readFile(both);
+    const v2 = 10 + (((b0[6] & 0x7f) << 21) | ((b0[7] & 0x7f) << 14) | ((b0[8] & 0x7f) << 7) | (b0[9] & 0x7f));
+    await writeFile(f, b0.subarray(v2));
+    const before = await media.metadataReport(f, 'mp3');
+    const c = await call('/strip-metadata', await readFile(f));
+    const tailTag = c.uploaded && c.uploaded.subarray(c.uploaded.length - 128, c.uploaded.length - 125).toString('latin1');
+    check('ID3v1 alone (no ID3v2): found before; 200, no TAG trailer after; PCM identical', before.leftovers.includes('id3v1') && !before.leftovers.includes('id3v2') && c.r.statusCode === 200 && tailTag !== 'TAG' && !c.uploaded.includes(Buffer.from('Fixtureville')) && (await samePcm(f, c.uploaded)), `${JSON.stringify(before.leftovers)} ${c.r.statusCode}`);
+  }
+  {
+    // an APEv2 tag (footer + item) appended to a plain mp3
+    const plain = path.join(tmp, 'plain-ape.mp3');
+    await sh('ffmpeg', [...tone, '-c:a', 'libmp3lame', '-id3v2_version', '0', '-write_id3v1', '0', plain]);
+    const item = Buffer.concat([Buffer.alloc(4), Buffer.alloc(4), Buffer.from('Title\0Fixtureville', 'latin1')]); item.writeUInt32LE('Fixtureville'.length, 0);
+    const footer = Buffer.alloc(32); footer.write('APETAGEX', 0, 'latin1'); footer.writeUInt32LE(2000, 8); footer.writeUInt32LE(item.length + 32, 12); footer.writeUInt32LE(1, 16);
+    const f = path.join(tmp, 'ape.mp3');
+    await writeFile(f, Buffer.concat([await readFile(plain), item, footer]));
+    const before = await media.metadataReport(f, 'mp3');
+    const c = await call('/strip-metadata', await readFile(f));
+    check('an APE tag: found before; 200, no APETAGEX after; PCM identical', before.leftovers.includes('ape') && c.r.statusCode === 200 && !c.uploaded.includes(Buffer.from('APETAGEX')) && !c.uploaded.includes(Buffer.from('Fixtureville')) && (await samePcm(plain, c.uploaded)), `${JSON.stringify(before.leftovers)} ${c.r.statusCode} ${c.r.body.slice(0, 100)}`);
+  }
+  {
+    // Ogg/Opus whose comment-header vendor is free text (same length as "ffmpeg", so the file stays valid)
+    const f = path.join(tmp, 'vendor.ogg');
+    await sh('ffmpeg', [...tone, '-c:a', 'libopus', f]);
+    const buf = await readFile(f);
+    const at = buf.indexOf(Buffer.from('OpusTags')) + 12;
+    if (buf.subarray(at, at + 6).toString() !== 'ffmpeg' && !buf.subarray(at - 4, at + 40).includes(Buffer.from('Lav'))) throw new Error('unexpected Opus vendor in the fixture');
+    const vlen = buf.readUInt32LE(at - 4);
+    const dirty = Buffer.from(buf); dirty.write('GPS 0.5 0.5 Fixtureville'.padEnd(vlen, '.').slice(0, vlen), at, 'latin1');
+    oggFixCrcs(dirty); // keep the pages valid, so the file is read as the real thing
+    const df = await writeTmp(dirty, '.ogg');
+    const before = await media.metadataReport(df, 'ogg');
+    const c = await call('/strip-metadata', dirty);
+    const after = c.uploaded && await (async () => { const o = await writeTmp(c.uploaded, '.ogg'); const r = await media.metadataReport(o, 'ogg'); await rm(o, { force: true }); return r; })();
+    check('Vorbis-comment vendor off the allowlist: flagged before; 200 — the remux writes the fixed vendor; the free text is gone; PCM identical', before.leftovers.includes('ogg-vendor') && c.r.statusCode === 200 && after?.clean && !c.uploaded.includes(Buffer.from('Fixtureville')) && (await samePcm(df, c.uploaded)), `${JSON.stringify(before.leftovers)} ${c.r.statusCode} ${JSON.stringify(after)}`);
+    check('the vendor allowlist: encoder identities pass, free text does not', media.vendorOk('ffmpeg') && media.vendorOk('Xiph.Org libVorbis I 20200704 (Reducing Environment)') && media.vendorOk('libopus 1.5.2') && media.vendorOk('Lavf61.7.100') && !media.vendorOk('GPS 0.5 0.5') && !media.vendorOk('Xiph.Org libVorbis I 20200704 (lat 51.5)') && !media.vendorOk(''));
+  }
+  {
+    // WebM with Vorbis: the comment header lives in CodecPrivate, which a remux copies untouched
+    const og = path.join(tmp, 'v.ogg'), wm = path.join(tmp, 'vorbis.webm');
+    await sh('ffmpeg', [...tone, '-c:a', 'vorbis', '-strict', '-2', '-ac', '2', '-metadata', 'title=Fixtureville', og]);
+    await sh('ffmpeg', ['-v', 'error', '-i', og, '-c', 'copy', wm]);
+    const okc = await call('/strip-metadata', await readFile(wm));
+    check('WebM/Vorbis with an encoder vendor in CodecPrivate: 200, the title (Matroska Tags) gone, PCM identical', okc.r.statusCode === 200 && !okc.uploaded.includes(Buffer.from('Fixtureville')) && (await samePcm(wm, okc.uploaded)), `${okc.r.statusCode} ${okc.r.body.slice(0, 120)}`);
+    // the same file with free text in that vendor field (same length — the file stays valid)
+    const b = Buffer.from(await readFile(wm));
+    const at = b.indexOf(Buffer.from('\x03vorbis', 'latin1')) + 7;
+    const vlen = b.readUInt32LE(at);
+    b.write('GPS 0.5 0.5 Fixtureville'.padEnd(vlen, '.').slice(0, vlen), at + 4, 'latin1');
+    const dirty = await writeTmp(b, '.webm');
+    const before = await media.metadataReport(dirty, 'matroska');
+    const c = await call('/strip-metadata', b);
+    check('WebM/Vorbis whose CodecPrivate vendor is free text: flagged; the remux can\'t change it → REFUSED, nothing written (fail closed)', before.leftovers.includes('mkv-vorbis-vendor') && c.r.statusCode >= 400 && c.uploaded === null, `${JSON.stringify(before.leftovers)} ${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
+  }
+  {
+    // Matroska attachment (the GPS photo) beside the sound
+    const mk = path.join(tmp, 'att.mkv');
+    await sh('ffmpeg', [...tone, '-c:a', 'libopus', '-attach', FIX('gps-art.jpg'), '-metadata:s:t', 'mimetype=image/jpeg', mk]);
+    const before = await media.metadataReport(mk, 'matroska');
+    const c = await call('/strip-metadata', await readFile(mk));
+    const after = c.uploaded && await (async () => { const o = await writeTmp(c.uploaded, '.webm'); const r = await media.metadataReport(o, 'matroska'); await rm(o, { force: true }); return r; })();
+    check('a Matroska attachment (a GPS photo): present before; 200, dropped (no attachment, no EXIF bytes); PCM identical', before.leftovers.includes('mkv-attachments') && before.otherStreams > 0 && c.r.statusCode === 200 && after?.clean && !c.uploaded.includes(Buffer.from('Exif\0\0', 'latin1')) && (await samePcm(mk, c.uploaded)), `${JSON.stringify(before)} ${c.r.statusCode} ${JSON.stringify(after)}`);
+  }
+  {
+    // H.264 user_data_unregistered SEI
+    const plain = path.join(tmp, 'sei-plain.mp4'), ud = path.join(tmp, 'sei-ud.mp4'), orient = path.join(tmp, 'sei-orient.mp4'), hevc = path.join(tmp, 'sei.hevc.mp4');
+    await sh('ffmpeg', ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc=duration=2:size=128x96:rate=10', '-f', 'lavfi', '-i', 'sine=duration=2', '-shortest', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', plain]);
+    await sh('ffmpeg', ['-y', '-v', 'error', '-i', plain, '-c', 'copy', '-bsf:v', 'h264_metadata=sei_user_data=086f3693-b7b3-4f2c-9653-21492feee5b8+GPS 0.5 0.5 Fixtureville', ud]);
+    await sh('ffmpeg', ['-y', '-v', 'error', '-i', ud, '-c', 'copy', '-bsf:v', 'h264_metadata=display_orientation=insert:rotate=90', orient]);
+    await sh('ffmpeg', ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc=duration=2:size=128x96:rate=10', '-c:v', 'libx265', '-pix_fmt', 'yuv420p', '-x265-params', 'log-level=none', hevc]);
+    const inUd = await sei.seiReport(ud, 'h264', tmp);
+    const c = await call('/strip-metadata', await readFile(ud));
+    const out = c.uploaded && await writeTmp(c.uploaded, '.mp4');
+    const outSei = out && await sei.seiReport(out, 'h264', tmp);
+    check('H.264 user-data SEI ("GPS … Fixtureville"): found before; 200, gone from the bitstream (re-scan: no private payload), picture frames and PCM IDENTICAL',
+      inUd.disallowed === 1 && c.r.statusCode === 200 && outSei?.disallowed === 0 && !c.uploaded.includes(Buffer.from('Fixtureville')) && (await frameHash(ud)) === (await frameHash(out)) && (await pcmHash(ud)) === (await pcmHash(out)),
+      `${JSON.stringify(inUd)} ${c.r.statusCode} ${c.r.body.slice(0, 100)} ${JSON.stringify(outSei)}`);
+    if (out) await rm(out, { force: true });
+    const cp = await call('/strip-metadata', await readFile(plain));
+    const pOut = cp.uploaded && await writeTmp(cp.uploaded, '.mp4');
+    check('only the allowlisted x264 settings SEI: kept as it is (no SEI dropped), 200', cp.r.statusCode === 200 && (await sei.seiReport(pOut, 'h264', tmp)).allowed === 1 && (await frameHash(plain)) === (await frameHash(pOut)));
+    if (pOut) await rm(pOut, { force: true });
+    // the output SEI scan is what stops a miss: sabotage the drop filter into a no-op
+    const realDrop = sei.dropSeiFilter;
+    sei.dropSeiFilter = () => 'null';
+    let sab;
+    try { sab = await call('/strip-metadata', await readFile(ud)); } finally { sei.dropSeiFilter = realDrop; }
+    check('with the SEI drop sabotaged, the OUTPUT bitstream scan refuses: 500 "private user data survived", nothing written (fails if verifySei is removed)', sab.r.statusCode === 500 && sab.uploaded === null && /private user data survived/.test(sab.json?.error || ''), `${sab.r.statusCode} ${sab.r.body.slice(0, 120)}`);
+    const co = await call('/strip-metadata', await readFile(orient));
+    check('private user data BESIDE picture-relevant SEI (display orientation) → REFUSED (415), nothing written', co.r.statusCode === 415 && co.uploaded === null, `${co.r.statusCode} ${co.r.body.slice(0, 120)}`);
+    const ch = await call('/strip-metadata', await readFile(hevc));
+    check('HEVC with only x265\'s allowlisted settings SEI: 200', ch.r.statusCode === 200, `${ch.r.statusCode} ${ch.r.body.slice(0, 120)}`);
+  }
+  {
+    // the scanner across chunk boundaries: SEI NALs straddling the 1 MB reads
+    const sc = (b) => Buffer.from([0, 0, 0, 1, ...b]);
+    const udSei = (text) => { const payload = Buffer.concat([Buffer.from('086f3693b7b34f2c965321492feee5b8', 'hex'), Buffer.from(text)]); return sc([0x06, 5, payload.length, ...payload, 0x80]); };
+    const filler = (n) => sc([0x0c, ...Buffer.alloc(n, 0xff)]); // filler NAL (type 12)
+    const parts = [filler((1 << 20) - 30), udSei('GPS 1'), filler((1 << 20) - 10), udSei('GPS 2'), filler(5000), udSei('GPS 3')];
+    const es = await writeTmp(Buffer.concat(parts), '.h264');
+    const r = await sei.scanAnnexB(es, 'h264');
+    check('SEI scan: payloads straddling the 1 MB chunk boundaries are all found (3)', r.disallowed === 3, JSON.stringify({ types: Object.fromEntries(r.types), disallowed: r.disallowed }));
+    await rm(es, { force: true });
+  }
+  {
+    // data and subtitle tracks (timecode data track, mov_text subtitles) beside the picture
+    const dt = path.join(tmp, 'tracks.mov'), srt = path.join(tmp, 's.srt');
+    await writeFile(srt, '1\n00:00:00,000 --> 00:00:01,000\nGPS 0.5 0.5 Fixtureville\n');
+    await sh('ffmpeg', ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc=duration=2:size=128x96:rate=10', '-i', srt, '-map', '0:v', '-map', '1:s', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:s', 'mov_text', '-timecode', '01:00:00:00', dt]);
+    const before = await media.metadataReport(dt, 'iso');
+    const c = await call('/strip-metadata', await readFile(dt));
+    const out = c.uploaded && await writeTmp(c.uploaded, '.mov');
+    const types = out && JSON.parse(await sh('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_type', '-of', 'json', out])).streams.map((x) => x.codec_type);
+    check('data + subtitle tracks (timecode, mov_text "GPS …"): present before; 200, DROPPED — only the picture remains', before.otherStreams >= 2 && c.r.statusCode === 200 && JSON.stringify(types) === '["video"]' && !c.uploaded.includes(Buffer.from('Fixtureville')), `${JSON.stringify(before)} ${c.r.statusCode} ${JSON.stringify(types)}`);
+    if (out) await rm(out, { force: true });
+  }
+  {
+    // a codec off the picture allowlist (Motion-JPEG frames can carry EXIF) → refused
+    const mj = path.join(tmp, 'mjpeg.mov');
+    await sh('ffmpeg', ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc=duration=1:size=64x48:rate=5', '-c:v', 'mjpeg', mj]);
+    const c = await call('/strip-metadata', await readFile(mj));
+    check('a picture codec off the allowlist (Motion-JPEG) → REFUSED (415)', c.r.statusCode === 415 && c.uploaded === null, `${c.r.statusCode}`);
+  }
+  {
+    // enhancement caps (P2-3): a declared duration over the cap, and an output over the cap
+    const long = path.join(tmp, 'long.mp3'), short = path.join(tmp, 'short.mp3');
+    await sh('ffmpeg', ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'sine=duration=10', '-c:a', 'libmp3lame', '-b:a', '8k', long]);
+    await sh('ffmpeg', ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'sine=duration=3', '-c:a', 'libmp3lame', '-b:a', '8k', short]);
+    process.env.ENHANCE_MAX_DURATION_SEC = '5';
+    const d = await call('/enhance', await readFile(long), { body: { enhancementType: 'clean' } });
+    delete process.env.ENHANCE_MAX_DURATION_SEC;
+    check('enhance: a 10 s input with a 5 s cap → 413 before any processing, nothing written', d.r.statusCode === 413 && d.uploaded === null, `${d.r.statusCode} ${d.r.body.slice(0, 100)}`);
+    process.env.ENHANCE_MAX_OUTPUT_BYTES = '100000';
+    const o = await call('/enhance', await readFile(short), { body: { enhancementType: 'clean' } });
+    delete process.env.ENHANCE_MAX_OUTPUT_BYTES;
+    check('enhance: an output over the byte cap (3 s → ~290 KB, cap 100 KB) → 413, cut off by -fs, nothing written', o.r.statusCode === 413 && o.uploaded === null, `${o.r.statusCode} ${o.r.body.slice(0, 100)}`);
+    const ok = await call('/enhance', await readFile(short), { body: { enhancementType: 'clean' } });
+    check('enhance within the caps: 200, and the upload is STREAMED (a ReadableStream body, duplex half, exact Content-Length)', ok.r.statusCode === 200 && ok.uploadInit?.duplex === 'half' && !Buffer.isBuffer(ok.uploadInit?.body) && typeof ok.uploadInit?.body?.getReader === 'function' && Number(ok.uploadHeaders?.['Content-Length']) === ok.uploaded?.length, `${ok.r.statusCode} ${JSON.stringify(ok.uploadHeaders)}`);
+  }
+  {
+    // memory: a 256 MB upload streamed from disk does not land in memory
+    const big = path.join(tmp, 'big.bin');
+    const fh = await require('fs/promises').open(big, 'w'); await fh.truncate(256 * 1024 * 1024); await fh.close();
+    global.gc?.();
+    const base = process.memoryUsage();
+    let peak = 0, got = 0;
+    const consume = async (u, init) => {
+      const reader = init.body.getReader();
+      let sinceGc = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        got += value.length; sinceGc += value.length;
+        // measure what is actually RETAINED (collect first), every 8 MB
+        if (sinceGc >= 8 << 20) { sinceGc = 0; global.gc?.(); const m = process.memoryUsage(); peak = Math.max(peak, m.arrayBuffers + m.external); }
+      }
+      return new Response('{}', { status: 200 });
+    };
+    await io.uploadFile(upUrl(), big, 'application/octet-stream', { deadlineMs: 60_000 }, consume);
+    const growth = peak - (base.arrayBuffers + base.external);
+    check(`a 256 MB output is streamed, not buffered: all bytes sent, retained memory grew ${(growth / 1048576).toFixed(1)} MB (< 48 MB; buffering would hold ≥ 256 MB)`, typeof global.gc === 'function' && got === 256 * 1024 * 1024 && growth < 48 * 1024 * 1024);
+    await rm(big, { force: true });
   }
   {
     // finding 1: an input with NO tags anything checks by name still gets remuxed (no "already clean" shortcut)
