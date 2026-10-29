@@ -36,6 +36,9 @@ async function hdr10PlusFromFixture() {
   throw new Error('fixture: no T.35 payload');
 }
 /** Decoded audio (first audio stream → s16le PCM), hashed: proves the SOUND is unchanged, not just stream counts. */
+/** The audio packets of a file, hashed in order (a stream copy: no decoding), for an MP3 whose remux gains an Info frame.
+ *  framemd5's sixth field is the packet's own hash (a skip-samples side-data hash may follow it on the first packet). */
+const packetHash = async (file) => crypto.createHash('sha256').update(await sh('ffmpeg', ['-v', 'error', '-i', file, '-map', '0:a:0', '-c', 'copy', '-f', 'framemd5', '-fflags', '+bitexact', 'pipe:1']).then((o) => o.split('\n').filter((l) => l && !l.startsWith('#')).map((l) => l.split(',')[5].trim()).join('\n'))).digest('hex');
 const pcmHash = async (file) => { const out = `${file}.pcm`; await sh('ffmpeg', ['-v', 'error', '-i', file, '-map', '0:a:0', '-f', 's16le', '-c:a', 'pcm_s16le', out]); const h = crypto.createHash('sha256').update(await readFile(out)).digest('hex'); await rm(out, { force: true }); return h; };
 /** Decoded video frames, hashed (framemd5 of the first picture stream). */
 const frameHash = async (file) => { const out = `${file}.fmd5`; await sh('ffmpeg', ['-v', 'error', '-i', file, '-map', '0:V:0', '-f', 'framemd5', out]); const t = (await readFile(out, 'utf8')).split('\n').filter((l) => l && !l.startsWith('#')).map((l) => l.split(',').pop().trim()).join(','); await rm(out, { force: true }); return crypto.createHash('sha256').update(t).digest('hex'); };
@@ -275,6 +278,59 @@ async function endpoints() {
     const before = await media.metadataReport(f, 'mp3');
     const c = await call('/strip-metadata', await readFile(f));
     check('an APE tag: found before; 200, no APETAGEX after; PCM identical', before.leftovers.includes('ape') && c.r.statusCode === 200 && !c.uploaded.includes(Buffer.from('APETAGEX')) && !c.uploaded.includes(Buffer.from('Fixtureville')) && (await samePcm(plain, c.uploaded)), `${JSON.stringify(before.leftovers)} ${c.r.statusCode} ${c.r.body.slice(0, 100)}`);
+  }
+  {
+    // Logic Pro's exports (Comma, 2026-10-29: two of Sandy's MP3s were refused while WAVs of the same audio passed).
+    // Logic writes STEREO CBR 320 at 44.1 kHz with no Xing/Info frame and an ID3 v2.2 tag (three-letter frames: TSS,
+    // COM iTunSMPB…). Every STEREO MP3 was refused: the remux's own Info frame reads back as a stream tag (encoder=Lavf),
+    // which mono files never show — and every MP3 case above is mono. Each shape here: 200, clean, stereo kept, PCM identical.
+    const logicBase = path.join(tmp, 'logic-none.mp3');
+    await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=2', '-f', 'lavfi', '-i', 'sine=frequency=660:duration=2', '-filter_complex', '[0][1]amerge=inputs=2', '-ar', '44100', '-c:a', 'libmp3lame', '-b:a', '320k', '-write_xing', '0', '-id3v2_version', '0', '-write_id3v1', '0', logicBase]);
+    // ID3 v2.2 by hand (ffmpeg writes only 2.3 / 2.4): 3-letter ids, 3-byte sizes, the size of the whole tag syncsafe
+    const f22 = (id, body) => { const h = Buffer.alloc(6); h.write(id, 0, 'latin1'); h.writeUIntBE(body.length, 3, 3); return Buffer.concat([h, body]); };
+    const txt = (s) => Buffer.from(`\0${s}`, 'latin1');
+    const frames = Buffer.concat([
+      f22('TT2', txt('Fixtureville')), f22('TP1', txt('Fixtureville Artist')), f22('TSS', txt('Logic Pro 12.3.1')), f22('TBP', txt('120')),
+      f22('COM', Buffer.from('\0engiTunSMPB\0 00000000 00000210 0000095E 0000000000300C92', 'latin1')), Buffer.alloc(64),
+    ]);
+    const id3hdr = Buffer.from([0x49, 0x44, 0x33, 2, 0, 0, (frames.length >> 21) & 0x7f, (frames.length >> 14) & 0x7f, (frames.length >> 7) & 0x7f, frames.length & 0x7f]);
+    const logic22 = path.join(tmp, 'logic-id3v22.mp3');
+    await writeFile(logic22, Buffer.concat([id3hdr, frames, await readFile(logicBase)]));
+    const tagged = async (v) => { const f = path.join(tmp, `logic-id3v2${v}.mp3`); await sh('ffmpeg', ['-v', 'error', '-i', logicBase, '-c', 'copy', '-write_xing', '0', '-id3v2_version', String(v), '-metadata', 'title=Fixtureville', '-metadata', 'artist=Fixtureville Artist', '-metadata', 'encoded_by=Logic Pro 12.3.1', '-metadata', 'comment=iTunSMPB 00000210', f]); return f; };
+    const xing = path.join(tmp, 'stereo-xing.mp3'); // a stereo MP3 WITH an Info frame (LAME / ffmpeg-made), the other shape
+    await sh('ffmpeg', ['-v', 'error', '-i', logicBase, '-c:a', 'libmp3lame', '-b:a', '320k', '-metadata', 'title=Fixtureville', xing]);
+    const logicWav = path.join(tmp, 'logic.wav');
+    await sh('ffmpeg', ['-v', 'error', '-i', logicBase, '-c:a', 'pcm_s24le', '-metadata', 'title=Fixtureville', '-metadata', 'encoded_by=Logic Pro 12.3.1', logicWav]);
+    const shapes = [
+      ['Logic MP3, stereo CBR 320, no Info frame, ID3 v2.2', logic22, 'mp3', true],
+      ['Logic MP3, ID3 v2.3', await tagged(3), 'mp3', true],
+      ['Logic MP3, ID3 v2.4', await tagged(4), 'mp3', true],
+      ['Logic MP3, no tags', logicBase, 'mp3', false],
+      ['stereo MP3 with an Info frame (LAME)', xing, 'mp3', true],
+      ['Logic WAV, stereo 24-bit, tagged', logicWav, 'wav', true],
+    ];
+    for (const [label, file, family, dirty] of shapes) {
+      const before = await media.metadataReport(file, family);
+      const c = await call('/strip-metadata', await readFile(file));
+      const out = c.uploaded && await writeTmp(c.uploaded, `.${family}`);
+      const rep = out && await media.metadataReport(out, family);
+      const chans = out && Number((await sh('ffprobe', ['-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=channels', '-of', 'csv=p=0', out])).trim());
+      // MP3: every audio packet byte-identical (a stream copy). Not PCM: the remux's Info frame makes a decoder skip the
+      // encoder's 529-sample start delay, which a file without one (Logic's) is decoded with. WAV: PCM identical.
+      const pcm = out && (family === 'mp3' ? (await packetHash(file)) === (await packetHash(out)) : await samePcm(file, c.uploaded));
+      if (out) await rm(out, { force: true });
+      check(`${label}: ${dirty ? 'dirty before; ' : ''}200 (exact shape), written back clean, still stereo, ${family === 'mp3' ? 'audio packets' : 'PCM'} identical, no tag text left`,
+        before.clean === !dirty && c.r.statusCode === 200 && exact(c.json) && rep?.clean && chans === 2 && pcm
+          && !['Fixtureville', 'Logic Pro', 'iTunSMPB'].some((s) => c.uploaded.includes(Buffer.from(s, 'latin1'))),
+        `${c.r.statusCode} ${c.r.body.slice(0, 140)} before=${JSON.stringify(before)} after=${JSON.stringify(rep)} channels=${chans}`);
+    }
+    // Comma's item 4, on its own: the ID3 v2.2 tag is seen, and then it's gone — no tag header, none of its frames' text
+    const before22 = await media.metadataReport(logic22, 'mp3');
+    const c22 = await call('/strip-metadata', await readFile(logic22));
+    check('ID3 v2.2 (Logic): found before (the header + its frames read as tags); after, no ID3 header at the start and no frame text anywhere',
+      before22.leftovers.includes('id3v2') && before22.formatTags > 0 && c22.r.statusCode === 200 && c22.uploaded.subarray(0, 3).toString('latin1') !== 'ID3'
+        && !['Fixtureville', 'Logic Pro 12.3.1', 'iTunSMPB'].some((s) => c22.uploaded.includes(Buffer.from(s, 'latin1'))),
+      `${JSON.stringify(before22)} ${c22.r.statusCode}`);
   }
   {
     // Ogg/Opus whose comment-header vendor is free text (same length as "ffmpeg", so the file stays valid)
