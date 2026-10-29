@@ -324,6 +324,12 @@ async function endpoints() {
           && !['Fixtureville', 'Logic Pro', 'iTunSMPB'].some((s) => c.uploaded.includes(Buffer.from(s, 'latin1'))),
         `${c.r.statusCode} ${c.r.body.slice(0, 140)} before=${JSON.stringify(before)} after=${JSON.stringify(rep)} channels=${chans}`);
     }
+    // the allowance's two edges (the Reviewer on worker #4): exactly `Lavf`, and only for MP3. The positive control first.
+    check('positive control: an MP3 stream tagged encoder=Lavf (the remux\'s own, bitexact) is structural', media.badStreamTags({ encoder: 'Lavf' }, 'mp3').length === 0);
+    const otherValues = ['Lavf62.3.100', 'LAME3.100', 'Lavf Fixtureville', 'lavf', ' Lavf', 'Lavf\n', ''];
+    check(`an MP3 stream whose encoder is anything else (${otherValues.map((v) => JSON.stringify(v)).join(', ')}) → reported`, otherValues.every((v) => JSON.stringify(media.badStreamTags({ encoder: v }, 'mp3')) === '["encoder"]'));
+    const families = ['wav', 'flac', 'ogg', 'matroska', 'iso'];
+    check(`encoder=Lavf on a stream of any other family (${families.join(', ')}) → reported`, families.every((f) => JSON.stringify(media.badStreamTags({ encoder: 'Lavf' }, f)) === '["encoder"]'));
     // Comma's item 4, on its own: the ID3 v2.2 tag is seen, and then it's gone — no tag header, none of its frames' text
     const before22 = await media.metadataReport(logic22, 'mp3');
     const c22 = await call('/strip-metadata', await readFile(logic22));
