@@ -392,13 +392,65 @@ async function endpoints() {
           c.r.statusCode === 415 && JSON.stringify(c.json) === JSON.stringify({ error: 'mp3-structure', detail: { at: where } }) && c.uploaded === null && (await jobDirs()).length === dirsBefore,
           `${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
       }
-      // what it does drop without refusing: zero padding after a leading tag, and a cut-off last frame
-      const padded = Buffer.concat([id3['v2.3'](SECRET), Buffer.alloc(300), pb.subarray(0, pb.length - 100)]);
+      // what it drops without refusing: zero padding after a leading tag (not audio)
+      const padded = Buffer.concat([id3['v2.3'](SECRET), Buffer.alloc(300), pb]);
       const cp = await call('/strip-metadata', padded);
       const cpOut = cp.uploaded && await writeTmp(cp.uploaded, '.mp3');
-      check(`a leading tag, 300 zero bytes, a cut-off last frame, ${who}: 200, the tag, the zeros and the cut frame gone, clean frame to frame`,
-        cp.r.statusCode === 200 && !cp.uploaded.includes(Buffer.from('Fixtureville')) && (await media.metadataReport(cpOut, 'mp3')).clean, `${cp.r.statusCode} ${cp.r.body.slice(0, 120)}`);
+      check(`a leading tag, then 300 zero bytes, ${who}: 200, the tag and the zeros gone, clean frame to frame, audio packets identical`,
+        cp.r.statusCode === 200 && !cp.uploaded.includes(Buffer.from('Fixtureville')) && (await media.metadataReport(cpOut, 'mp3')).clean && (await packetHash(plain)) === (await packetHash(cpOut)), `${cp.r.statusCode} ${cp.r.body.slice(0, 120)}`);
       if (cpOut) await rm(cpOut, { force: true });
+      // Astra's P2-2 (2026-11-01): nothing is trimmed. A cut-off last frame is refused (a re-export), and so is a
+      // trailer read back from the end that overlaps a frame: a cut frame with a real ID3v1 after it, which can't be
+      // told from a tag inside the last frame
+      const packets = (await sh('ffprobe', ['-v', 'error', '-select_streams', 'a', '-show_entries', 'packet=pos,size', '-of', 'csv=p=0', plain])).trim().split('\n')
+        .map((l) => { const [size, pos] = l.split(',').filter(Boolean).map(Number); return { pos, size }; }); // ffprobe prints size, then pos
+      const lastFrame = packets[packets.length - 1];
+      const v1 = (text) => { const b = Buffer.alloc(128); b.write('TAG', 0, 'latin1'); b.write(text, 3, 'latin1'); b[127] = 255; return b; };
+      for (const [label, bytes, code, where] of [
+        ['a cut-off last frame (100 bytes short)', pb.subarray(0, pb.length - 100), 'mp3-truncated', lastFrame.pos],
+        ['a cut-off last frame with an ID3v1 tag after it', Buffer.concat([pb.subarray(0, pb.length - 100), v1(SECRET)]), 'mp3-tag-in-audio', pb.length - 100],
+      ]) {
+        const dirsBefore = (await jobDirs()).length;
+        const c = await call('/strip-metadata', bytes);
+        check(`${label}, ${who} → REFUSED 415 {error: ${code}, detail: {at: ${where}}}, nothing written, no temp dir left`,
+          c.r.statusCode === 415 && JSON.stringify(c.json) === JSON.stringify({ error: code, detail: { at: where } }) && c.uploaded === null && (await jobDirs()).length === dirsBefore,
+          `${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
+      }
+      const tagged1 = await call('/strip-metadata', Buffer.concat([pb, v1(SECRET)]));
+      check(`positive control: the whole last frame, then an ID3v1 tag, ${who}: 200, the tag gone`, tagged1.r.statusCode === 200 && exact(tagged1.json) && !tagged1.uploaded.includes(Buffer.from('Fixtureville')), `${tagged1.r.statusCode} ${tagged1.r.body.slice(0, 120)}`);
+      // Astra's P1 (2026-11-01): a tag INSIDE a frame, written over the end of its interior (the frame's length
+      // unchanged), in the last frame and a middle one, each kind. Compressed audio is never cut: the file is refused
+      // (415 mp3-tag-in-audio, where the tag is seen), nothing written. And the output walk catches each one on its own:
+      // given the bytes directly, and through the endpoint with the input rebuild sabotaged into a plain copy.
+      const apeItem = (text) => { const item = Buffer.concat([Buffer.alloc(8), Buffer.from(`Title\0${text}`, 'latin1')]); item.writeUInt32LE(text.length, 0); return item; };
+      const ape = (text) => { const item = apeItem(text); const f = Buffer.alloc(32); f.write('APETAGEX', 0, 'latin1'); f.writeUInt32LE(2000, 8); f.writeUInt32LE(item.length + 32, 12); f.writeUInt32LE(1, 16); return Buffer.concat([item, f]); };
+      const kinds = [...Object.entries(id3).map(([v, make]) => [`ID3 ${v}`, make, 'id3v2']), ['ID3v1', v1, 'id3v1'], ['APE (an item and its footer)', ape, 'ape']];
+      for (const [place, frame] of [['the last frame', lastFrame], ['a middle frame', packets[Math.floor(packets.length / 2)]]]) {
+        for (const [kind, make, named] of kinds) {
+          const t = make(SECRET);
+          const bytes = Buffer.from(pb);
+          const start = frame.pos + frame.size - t.length;
+          t.copy(bytes, start);
+          // where it's seen: where the tag starts; an APE tag inside a middle frame by its footer (at the end of the
+          // file, a trailer is read back from the end: from its first item)
+          const where = start + (named === 'ape' && place === 'a middle frame' ? apeItem(SECRET).length : 0);
+          const dirsBefore = (await jobDirs()).length;
+          const c = await call('/strip-metadata', bytes);
+          check(`${kind} inside ${place}, ${who} → REFUSED 415 {error: mp3-tag-in-audio, detail: {at: ${where}}}, nothing written, no temp dir left`,
+            c.r.statusCode === 415 && JSON.stringify(c.json) === JSON.stringify({ error: 'mp3-tag-in-audio', detail: { at: where } }) && c.uploaded === null && (await jobDirs()).length === dirsBefore,
+            `${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
+          const f = await writeTmp(bytes, '.mp3');
+          const walked = await mp3Frames.mp3Leftovers(f);
+          await rm(f, { force: true });
+          const realSanitize = media.sanitizeMp3;
+          media.sanitizeMp3 = async (i, o) => { await copyFile(i, o); return { frames: 0, removed: {} }; };
+          let s;
+          try { s = await call('/strip-metadata', bytes); } finally { media.sanitizeMp3 = realSanitize; }
+          check(`${kind} inside ${place}, ${who}, the output walk alone: names it (${named}); with the input rebuild sabotaged, 500 metadata-survived (1 leftover), nothing written`,
+            JSON.stringify(walked) === JSON.stringify([named]) && s.r.statusCode === 500 && s.json?.error === 'metadata-survived' && s.json.detail?.leftovers === 1 && s.uploaded === null,
+            `walked=${JSON.stringify(walked)} ${s.r.statusCode} ${s.r.body.slice(0, 120)}`);
+        }
+      }
     }
     // the OUTPUT walk stands on its own: with the input rebuild sabotaged into a plain copy, a tag between frames
     // reaches the remux, ffmpeg keeps it, and the output walk refuses — 500 metadata-survived, nothing written
@@ -436,6 +488,87 @@ async function endpoints() {
       const got = [await walk(frames), await walk(Buffer.concat([frames, Buffer.alloc(1)])), await walk(frames.subarray(0, frames.length - 10)), await walk(Buffer.concat([frames, id3['v2.4 with a footer']('x')])), await walk(Buffer.concat([Buffer.alloc(1), frames]))];
       check('the output walk: frames only → []; +1 zero byte → mp3-unparsed; last frame cut → mp3-short-frame; a v2.4 tag after → id3v2; a zero byte first → mp3-unparsed',
         JSON.stringify(got) === JSON.stringify(['[]', '["mp3-unparsed"]', '["mp3-short-frame"]', '["id3v2"]', '["mp3-unparsed"]']), JSON.stringify(got));
+    }
+    // near misses from real audio (Sandy's 94-minute set, 2026-11-01, refused at byte 45,522,714 by this check's
+    // first version): quiet frames are mostly zero bytes, so a chance "TAG" or "ID3" there reads as a well-formed EMPTY
+    // tag. Each written over a middle frame's end: accepted by the input rebuild and clean to the output walk. Then the
+    // same shapes carrying text: refused.
+    {
+      const plainM = path.join(tmp, 'placed-mono.mp3');
+      const pm = await readFile(plainM);
+      const pk = (await sh('ffprobe', ['-v', 'error', '-select_streams', 'a', '-show_entries', 'packet=pos,size', '-of', 'csv=p=0', plainM])).trim().split('\n')
+        .map((l) => { const [size, pos] = l.split(',').filter(Boolean).map(Number); return { pos, size }; });
+      const mid = pk[Math.floor(pk.length / 2)];
+      const over = (t) => { const b = Buffer.from(pm); t.copy(b, mid.pos + mid.size - t.length); return b; };
+      const pad = (head, n = 128) => Buffer.concat([head, Buffer.alloc(n - head.length)]);
+      const twice = async (bytes) => {
+        const f = await writeTmp(bytes, '.mp3'), o = `${f}.frames`;
+        let got;
+        try { await mp3Frames.sanitizeMp3(f, o); got = JSON.stringify(await mp3Frames.mp3Leftovers(o)); } catch (e) { got = `${e.workerCode} ${JSON.stringify(e.workerDetail)}`; }
+        await rm(f, { force: true }); await rm(o, { force: true });
+        return got;
+      };
+      const misses = [
+        ['Sandy\'s set\'s own bytes: TAG ßG}2oô, then zeros', pad(Buffer.from('544147df477d326ff4', 'hex'))],
+        ['TAG, a title of 6 letters and digits ("Track 1"), zeros', pad(Buffer.from('TAGTrack 1', 'latin1'))],
+        ['ID3 v2.3 of size 0, then zeros', pad(Buffer.from('ID3\x03\x00\x00\x00\x00\x00\x00', 'latin1'))],
+        ['ID3 v2.4 whose body is zeros (padding only)', pad(Buffer.concat([Buffer.from('ID3\x04\x00\x00', 'latin1'), Buffer.from([0, 0, 0, 60])]))],
+      ];
+      const got = [];
+      for (const [, t] of misses) got.push(await twice(over(t)));
+      check(`near misses, ${misses.length} (${misses.map(([l]) => l).join('; ')}): each accepted by the input rebuild and clean to the output walk`, got.every((g) => g === '[]'), JSON.stringify(got));
+      const nick = await call('/strip-metadata', over(misses[0][1]));
+      check('...and Sandy\'s set\'s bytes through the endpoint: 200', nick.r.statusCode === 200 && exact(nick.json), `${nick.r.statusCode} ${nick.r.body.slice(0, 120)}`);
+      const carrying = [
+        ['TAG with a title of 8 letters and digits ("Track 123")', pad(Buffer.from('TAGTrack 123', 'latin1')), 'id3v1'],
+        ['ID3 v2.3 with a TIT2 frame', id3['v2.3']('x'), 'id3v2'],
+      ];
+      for (const [label, t, named] of carrying) {
+        const where = mid.pos + mid.size - t.length;
+        check(`...carrying text: ${label} → refused at ${where} (mp3-tag-in-audio), the output walk names it (${named})`,
+          (await twice(over(t))) === `mp3-tag-in-audio {"at":${where}}` && JSON.stringify(await (async () => { const f = await writeTmp(over(t), '.mp3'); const r = await mp3Frames.mp3Leftovers(f); await rm(f, { force: true }); return r; })()) === JSON.stringify([named]));
+      }
+    }
+    // false refusals (the Reviewer, 2026-11-01): compressed audio is close to random bytes, so "TAG" and "ID3" turn up
+    // inside real frames by chance (about once per 16 MB each). A corpus of clean encodes, noise and tone, mono and
+    // stereo, 32 to 48 kHz, CBR 32k–320k and VBR: every one accepted by the input rebuild and clean to the output walk,
+    // and through the endpoint for a sample of them. The signatures that DO turn up in it are counted, so it's the
+    // validation that lets them through, not luck (a "TAG"-alone ID3v1 fails here).
+    {
+      const count = (b, m) => { let n = 0; for (let i = b.indexOf(m); i >= 0; i = b.indexOf(m, i + 1)) n++; return n; };
+      let files = 0, bytes = 0, rawTag = 0, rawId3 = 0, through = 0;
+      const refused = [];
+      // noise and tone throughout, at every rate and mode; and (as real music has, and the noise never does) quiet:
+      // tone bursts with fades into digital silence, at the common rates
+      const cases = [];
+      for (const rate of [32000, 44100, 48000]) for (const ch of [1, 2]) for (const mode of [['-b:a', '32k'], ['-b:a', '64k'], ['-b:a', '128k'], ['-b:a', '192k'], ['-b:a', '256k'], ['-b:a', '320k'], ['-q:a', '0'], ['-q:a', '5']]) cases.push([rate, ch, mode, false]);
+      for (const rate of [44100, 48000]) for (const ch of [1, 2]) for (const mode of [['-b:a', '128k'], ['-b:a', '320k'], ['-q:a', '0']]) cases.push([rate, ch, mode, true]);
+      for (const [rate, ch, mode, quiet] of cases) {
+        {
+          {
+            const seed = ++files;
+            const f = path.join(tmp, `corpus-${seed}.mp3`), o = `${f}.frames`;
+            const source = quiet
+              ? ['-f', 'lavfi', '-i', `aevalsrc=exprs=if(lt(mod(t\\,5)\\,2)\\,0.4*sin(2*PI*${220 + 30 * (seed % 9)}*t)*min(1\\,min(mod(t\\,5)\\,2-mod(t\\,5))*2)\\,0):s=${rate}:d=150`]
+              : ['-f', 'lavfi', '-i', `anoisesrc=d=150:c=${seed % 2 ? 'pink' : 'white'}:a=0.25:seed=${seed}:r=${rate}`, '-f', 'lavfi', '-i', `sine=frequency=${220 + 55 * (seed % 7)}:duration=150:sample_rate=${rate}`, '-filter_complex', '[0][1]amix=inputs=2'];
+            await sh('ffmpeg', ['-v', 'error', ...source, '-ac', String(ch), '-ar', String(rate), '-c:a', 'libmp3lame', ...mode, '-id3v2_version', '0', '-write_id3v1', '0', f]);
+            const b = await readFile(f);
+            bytes += b.length; rawTag += count(b, Buffer.from('TAG')); rawId3 += count(b, Buffer.from('ID3'));
+            try {
+              await mp3Frames.sanitizeMp3(f, o);
+              const left = await mp3Frames.mp3Leftovers(o);
+              if (left.length) refused.push(`${path.basename(f)}: output walk ${left}`);
+            } catch (e) { refused.push(`${path.basename(f)}: ${e.workerCode} ${JSON.stringify(e.workerDetail)}`); }
+            if (seed % 6 === 0) {
+              const c = await call('/strip-metadata', b);
+              if (c.r.statusCode === 200 && exact(c.json)) through++; else refused.push(`${path.basename(f)}: endpoint ${c.r.statusCode} ${c.r.body.slice(0, 80)}`);
+            }
+            await rm(f, { force: true }); await rm(o, { force: true });
+          }
+        }
+      }
+      check(`no false refusals: ${files} clean encodes (${(bytes / 1e6).toFixed(1)} MB, ${cases.filter((c) => c[3]).length} of them with fades into silence) all accepted by the input rebuild and clean to the output walk, ${through} of them 200 through the endpoint; the validation ignored ${rawTag} raw "TAG" and ${rawId3} raw "ID3" inside their frames (at least one of each, or this proves nothing)`,
+        files >= 40 && refused.length === 0 && through === Math.floor(files / 6) && rawTag >= 1 && rawId3 >= 1, refused.slice(0, 5).join(' | '));
     }
   }
   {
@@ -1046,23 +1179,71 @@ async function endpoints() {
     check('no secret → 401 {error: unauthorized}', noSecret.statusCode === 401 && noSecret.body === '{"error":"unauthorized"}', noSecret.body);
     const badBody = await app.inject({ method: 'POST', url: '/strip-metadata', headers: H, payload: { sourceUrl: `https://evil.example/${MARKERS[0]}`, uploadUrl: 'x' } });
     check('a refused request body → 400 {error: bad-request}, the URL not echoed', badBody.statusCode === 400 && badBody.body === '{"error":"bad-request"}', badBody.body);
-    // Fastify's own errors, before any handler runs: a body that isn't JSON (its parse error quotes the body) and an
-    // unknown content type. Captured at app.log as the jobs' logs are (the Reviewer's P3 on #4)
-    const fastifyLogs = [];
-    const realInfo = app.log.info, realError = app.log.error;
-    app.log.info = (...a) => { fastifyLogs.push(JSON.stringify(a)); };
-    app.log.error = (...a) => { fastifyLogs.push(JSON.stringify(a)); };
-    let notJson, oddType;
+    // Astra's P2-3 (2026-11-01, after the Reviewer's P3): Fastify's own replies and log lines hold no request text
+    // either: a body that isn't JSON (its parse error quotes the body), an unknown content type, a body over the
+    // limit, routes the worker doesn't have (markers in the path and the query), and a hook that throws before any
+    // handler runs. The log is captured where pino WRITES it, so Fastify's own request lines are seen as written.
+    const guards = require('../lib/guards');
+    const logging = require('../lib/logging');
+    const pino = require('pino');
+    const stream = app.log[pino.symbols.streamSym];
+    const written = [];
+    const realWrite = stream.write;
+    const realSecretOk = guards.secretOk;
+    const json = { ...H, 'content-type': 'application/json' };
+    const asked = {};
+    stream.write = function (line) { written.push(String(line)); return true; };
     try {
-      notJson = await app.inject({ method: 'POST', url: '/strip-metadata', headers: { ...H, 'content-type': 'application/json' }, payload: `{"sourceUrl": "${loud}", oops` });
-      oddType = await app.inject({ method: 'POST', url: '/strip-metadata', headers: { ...H, 'content-type': 'text/x-fixture' }, payload: loud });
-    } finally { app.log.info = realInfo; app.log.error = realError; }
-    const fl = fastifyLogs.join('');
-    for (const [label, res] of [['a body that isn\'t JSON (its parse error quotes the body)', notJson], ['an unknown content type', oddType]]) {
-      check(`${label} → 400 {error: bad-request} exactly, logged as the code and status, no marker in the reply or the log`,
-        res.statusCode === 400 && res.body === '{"error":"bad-request"}' && !MARKERS.some((m) => res.body.includes(m) || fl.includes(m)), `${res.statusCode} ${res.body.slice(0, 160)}`);
+      asked.notJson = await app.inject({ method: 'POST', url: '/strip-metadata?token=SECRETTOKEN', headers: json, payload: `{"sourceUrl": "${loud}", oops` });
+      asked.oddType = await app.inject({ method: 'POST', url: '/strip-metadata', headers: { ...H, 'content-type': 'text/x-fixture' }, payload: loud });
+      asked.oversized = await app.inject({ method: 'POST', url: '/strip-metadata', headers: json, payload: JSON.stringify({ sourceUrl: loud.repeat(Math.ceil(1.2e6 / loud.length)) }) });
+      asked.unknown = await app.inject({ method: 'POST', url: `/no-such-route/${encodeURIComponent(MARKERS[0])}?token=SECRETTOKEN&k=sk_live_FIXTURE0000`, headers: json, payload: { sourceUrl: loud } });
+      asked.unknownNoSecret = await app.inject({ method: 'GET', url: `/Fixtureville/${encodeURIComponent(MARKERS[0])}?token=SECRETTOKEN` });
+      guards.secretOk = () => { throw new Error(`hook failed: ${loud}`); };
+      asked.hookThrows = await app.inject({ method: 'POST', url: '/strip-metadata?token=SECRETTOKEN', headers: json, payload: { sourceUrl: loud } });
+      await new Promise((r) => setImmediate(r)); // the "request completed" lines
+    } finally {
+      guards.secretOk = realSecretOk;
+      stream.write = realWrite;
     }
-    check('both logged by the error handler: "Request refused", status 400, error bad-request', (fl.match(/"status":400,"error":"bad-request"\},"Request refused"/g) || []).length === 2, fl.slice(0, 300));
+    // the markers as they'd appear in a URL, too (encoded)
+    const LOGMARKS = [...MARKERS, 'Jane', 'SECRETTOKEN', 'sk_live_FIXTURE0000', 'eyJhbGci'];
+    const leaks = (text) => LOGMARKS.filter((m) => text.includes(m) || text.includes(encodeURIComponent(m)));
+    const w = written.join('');
+    const parsed = written.map((l) => { try { return JSON.parse(l); } catch { return null; } });
+    for (const [label, key, status, body] of [
+      ['a body that isn\'t JSON (its parse error quotes the body)', 'notJson', 400, '{"error":"bad-request"}'],
+      ['an unknown content type (Fastify\'s 415)', 'oddType', 400, '{"error":"bad-request"}'],
+      ['a body over the 1 MB limit (Fastify\'s 413)', 'oversized', 400, '{"error":"bad-request"}'],
+      ['a route the worker doesn\'t have, markers in its path and query', 'unknown', 404, '{"error":"not-found"}'],
+      ['an unknown route without the secret (the secret is checked before routing)', 'unknownNoSecret', 401, '{"error":"unauthorized"}'],
+      ['the secret check throwing before any handler (a pre-handler failure)', 'hookThrows', 500, '{"error":"internal"}'],
+    ]) {
+      const res = asked[key];
+      check(`${label} → ${status} ${body} exactly, no marker in the reply`, res.statusCode === status && res.body === body && leaks(res.body).length === 0, `${res.statusCode} ${res.body.slice(0, 160)}`);
+    }
+    check(`what pino wrote for those ${Object.keys(asked).length} requests (${written.length} lines): no marker, plain or URL-encoded, anywhere`, written.length >= 12 && leaks(w).length === 0, `${leaks(w).join(', ')} ${w.slice(0, 300)}`);
+    check('...every line a listed message, every request as {method, route} only (route "unmatched" for the unknown ones), no err text',
+      parsed.every((l) => l && logging.MESSAGES.has(l.msg) && (!l.req || JSON.stringify(Object.keys(l.req)) === '["method","route"]') && (!l.err || JSON.stringify(Object.keys(l.err)) === '["code"]'))
+        && parsed.filter((l) => l.msg === 'incoming request' && l.req.route === 'unmatched').length === 2,
+      written.slice(0, 4).join(''));
+    check('...each refusal logged by its handler, as route, status and code', ['"route":"/strip-metadata","status":400,"error":"bad-request"', '"route":"unmatched","status":404,"error":"not-found"', '"route":"/strip-metadata","status":500,"error":"internal"'].every((s) => w.includes(s)), w.slice(0, 300));
+    // the logger on its own, for the lines Fastify writes that a test can't easily provoke: an Error as the message
+    // (its hooks' failures), a message with the URL in it ("Reply was already sent…"), a request with a query and
+    // headers, an err with a stack and a listed code, and the startup line
+    {
+      const lines = [];
+      const lg = pino(logging.loggerOptions(), { write: (l) => lines.push(JSON.parse(l)) });
+      lg.error(new Error(loud));
+      lg.warn(`Reply was already sent, did you forget to "return reply" in the "/strip-metadata?${loud}" (POST) route?`);
+      lg.info({ req: { method: 'POST', url: `/strip-metadata?${loud}`, headers: { cookie: loud }, hostname: loud } }, 'incoming request');
+      lg.error({ err: Object.assign(new Error(loud), { workerCode: 'internal', stack: loud }) }, loud);
+      lg.info('Server listening at http://0.0.0.0:3001');
+      const got = lines.map((l) => [l.msg, l.req ?? l.err ?? null]);
+      check('the logger: an Error, a URL in a message, a request with a query and headers, an err with a stack → message withheld, {method, route}, {code}; the startup line kept; no marker',
+        JSON.stringify(got) === JSON.stringify([[logging.WITHHELD, { code: null }], [logging.WITHHELD, null], ['incoming request', { method: 'POST', route: '/strip-metadata' }], [logging.WITHHELD, { code: 'internal' }], ['Server listening at http://0.0.0.0:3001', null]])
+          && leaks(JSON.stringify(lines)).length === 0, JSON.stringify(got));
+    }
   }
   const logs = allLogs.join('');
   check('logs carry bucket/key only — no URL, no token (finding 8)', logs.length > 0 && !/READTOKEN|WRITETOKEN|token=|https?:\/\//.test(logs) && logs.includes('media-incoming/0xabc/5f1e'), logs.slice(0, 200));

@@ -5,7 +5,8 @@ const crypto = require('crypto');
 // Through the module object (not destructured): the endpoint tests swap a
 // step out to prove the output verification is what refuses a dirty file.
 const media = require('./lib/stripMedia');
-const { SECRET_HEADER, secretOk } = require('./lib/guards');
+const guards = require('./lib/guards');
+const { SECRET_HEADER } = guards;
 const io = require('./lib/storageIO');
 const sei = require('./lib/videoSei');
 const limits = require('./lib/limits');
@@ -13,10 +14,12 @@ const proc = require('./lib/proc');
 const commands = require('./lib/commands');
 const inputs = require('./lib/inputs');
 const { tag, failure } = require('./lib/errors');
+const { loggerOptions, routeOf } = require('./lib/logging');
 
 // Use system FFmpeg (installed via apt in Dockerfile)
 
-const app = Fastify({ logger: true });
+// Its own lines and Fastify's go through ./lib/logging: no URL, no message text
+const app = Fastify({ logger: loggerOptions() });
 
 // Enable CORS for mixmi frontend
 app.register(cors, {
@@ -39,19 +42,26 @@ app.addHook('onRequest', async (request, reply) => {
   if (OPEN_ROUTES.has(route)) return;
   const secret = process.env.MEDIA_WORKER_SECRET;
   if (!secret) return reply.status(503).send({ error: 'not-configured' });
-  if (!secretOk(request.headers[SECRET_HEADER], secret)) return reply.status(401).send({ error: 'unauthorized' });
+  if (!guards.secretOk(request.headers[SECRET_HEADER], secret)) return reply.status(401).send({ error: 'unauthorized' });
 });
 
 // Fastify's own errors (a body that isn't JSON, one too large, an unknown content
-// type…) leave as a code too: its default handler replies with the error's message
-// and logs it, and a JSON parse error's message quotes the body (the Reviewer's P3
-// on #4). A 4xx is bad-request, anything else internal; logged as code and status.
+// type, a hook that throws…) leave as a code too: its default handler replies with
+// the error's message and logs it, and a JSON parse error's message quotes the body
+// (the Reviewer's P3 on #4, Astra's P2-3). A 4xx is bad-request, anything else
+// internal; logged as route, code and status.
 app.setErrorHandler((error, request, reply) => {
   const { status, body } = failure(error, (e) => (e.statusCode >= 400 && e.statusCode < 500 ? 'bad-request' : null));
-  const line = { route: request.routeOptions?.url ?? null, status, ...body };
+  const line = { route: routeOf(request.url), status, ...body };
   if (status < 500) app.log.info(line, 'Request refused');
   else app.log.error(line, 'Request failed');
   reply.status(status).send(body);
+});
+// ...and a route the worker doesn't have: Fastify's default 404 echoes the method
+// and URL in its reply and its log
+app.setNotFoundHandler((request, reply) => {
+  app.log.info({ route: 'unmatched', status: 404, error: 'not-found' }, 'Route not found');
+  reply.status(404).send({ error: 'not-found' });
 });
 
 // FFmpeg filter chains for each enhancement type
