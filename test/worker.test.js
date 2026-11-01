@@ -36,6 +36,9 @@ async function hdr10PlusFromFixture() {
   throw new Error('fixture: no T.35 payload');
 }
 /** Decoded audio (first audio stream → s16le PCM), hashed: proves the SOUND is unchanged, not just stream counts. */
+/** The audio packets of a file, hashed in order (a stream copy: no decoding), for an MP3 whose remux gains an Info frame.
+ *  framemd5's sixth field is the packet's own hash (a skip-samples side-data hash may follow it on the first packet). */
+const packetHash = async (file) => crypto.createHash('sha256').update(await sh('ffmpeg', ['-v', 'error', '-i', file, '-map', '0:a:0', '-c', 'copy', '-f', 'framemd5', '-fflags', '+bitexact', 'pipe:1']).then((o) => o.split('\n').filter((l) => l && !l.startsWith('#')).map((l) => l.split(',')[5].trim()).join('\n'))).digest('hex');
 const pcmHash = async (file) => { const out = `${file}.pcm`; await sh('ffmpeg', ['-v', 'error', '-i', file, '-map', '0:a:0', '-f', 's16le', '-c:a', 'pcm_s16le', out]); const h = crypto.createHash('sha256').update(await readFile(out)).digest('hex'); await rm(out, { force: true }); return h; };
 /** Decoded video frames, hashed (framemd5 of the first picture stream). */
 const frameHash = async (file) => { const out = `${file}.fmd5`; await sh('ffmpeg', ['-v', 'error', '-i', file, '-map', '0:V:0', '-f', 'framemd5', out]); const t = (await readFile(out, 'utf8')).split('\n').filter((l) => l && !l.startsWith('#')).map((l) => l.split(',').pop().trim()).join(','); await rm(out, { force: true }); return crypto.createHash('sha256').update(t).digest('hex'); };
@@ -277,6 +280,149 @@ async function endpoints() {
     check('an APE tag: found before; 200, no APETAGEX after; PCM identical', before.leftovers.includes('ape') && c.r.statusCode === 200 && !c.uploaded.includes(Buffer.from('APETAGEX')) && !c.uploaded.includes(Buffer.from('Fixtureville')) && (await samePcm(plain, c.uploaded)), `${JSON.stringify(before.leftovers)} ${c.r.statusCode} ${c.r.body.slice(0, 100)}`);
   }
   {
+    // Logic Pro's exports (Comma, 2026-10-29: two of Sandy's MP3s were refused while WAVs of the same audio passed).
+    // Logic writes STEREO CBR 320 at 44.1 kHz with no Xing/Info frame and an ID3 v2.2 tag (three-letter frames: TSS,
+    // COM iTunSMPB…). Every STEREO MP3 was refused: the remux's own Info frame reads back as a stream tag (encoder=Lavf),
+    // which mono files never show — and every MP3 case above is mono. Each shape here: 200, clean, stereo kept, PCM identical.
+    const logicBase = path.join(tmp, 'logic-none.mp3');
+    await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=2', '-f', 'lavfi', '-i', 'sine=frequency=660:duration=2', '-filter_complex', '[0][1]amerge=inputs=2', '-ar', '44100', '-c:a', 'libmp3lame', '-b:a', '320k', '-write_xing', '0', '-id3v2_version', '0', '-write_id3v1', '0', logicBase]);
+    // ID3 v2.2 by hand (ffmpeg writes only 2.3 / 2.4): 3-letter ids, 3-byte sizes, the size of the whole tag syncsafe
+    const f22 = (id, body) => { const h = Buffer.alloc(6); h.write(id, 0, 'latin1'); h.writeUIntBE(body.length, 3, 3); return Buffer.concat([h, body]); };
+    const txt = (s) => Buffer.from(`\0${s}`, 'latin1');
+    const frames = Buffer.concat([
+      f22('TT2', txt('Fixtureville')), f22('TP1', txt('Fixtureville Artist')), f22('TSS', txt('Logic Pro 12.3.1')), f22('TBP', txt('120')),
+      f22('COM', Buffer.from('\0engiTunSMPB\0 00000000 00000210 0000095E 0000000000300C92', 'latin1')), Buffer.alloc(64),
+    ]);
+    const id3hdr = Buffer.from([0x49, 0x44, 0x33, 2, 0, 0, (frames.length >> 21) & 0x7f, (frames.length >> 14) & 0x7f, (frames.length >> 7) & 0x7f, frames.length & 0x7f]);
+    const logic22 = path.join(tmp, 'logic-id3v22.mp3');
+    await writeFile(logic22, Buffer.concat([id3hdr, frames, await readFile(logicBase)]));
+    const tagged = async (v) => { const f = path.join(tmp, `logic-id3v2${v}.mp3`); await sh('ffmpeg', ['-v', 'error', '-i', logicBase, '-c', 'copy', '-write_xing', '0', '-id3v2_version', String(v), '-metadata', 'title=Fixtureville', '-metadata', 'artist=Fixtureville Artist', '-metadata', 'encoded_by=Logic Pro 12.3.1', '-metadata', 'comment=iTunSMPB 00000210', f]); return f; };
+    const xing = path.join(tmp, 'stereo-xing.mp3'); // a stereo MP3 WITH an Info frame (LAME / ffmpeg-made), the other shape
+    await sh('ffmpeg', ['-v', 'error', '-i', logicBase, '-c:a', 'libmp3lame', '-b:a', '320k', '-metadata', 'title=Fixtureville', xing]);
+    const logicWav = path.join(tmp, 'logic.wav');
+    await sh('ffmpeg', ['-v', 'error', '-i', logicBase, '-c:a', 'pcm_s24le', '-metadata', 'title=Fixtureville', '-metadata', 'encoded_by=Logic Pro 12.3.1', logicWav]);
+    const shapes = [
+      ['Logic MP3, stereo CBR 320, no Info frame, ID3 v2.2', logic22, 'mp3', true],
+      ['Logic MP3, ID3 v2.3', await tagged(3), 'mp3', true],
+      ['Logic MP3, ID3 v2.4', await tagged(4), 'mp3', true],
+      ['Logic MP3, no tags', logicBase, 'mp3', false],
+      ['stereo MP3 with an Info frame (LAME)', xing, 'mp3', true],
+      ['Logic WAV, stereo 24-bit, tagged', logicWav, 'wav', true],
+    ];
+    for (const [label, file, family, dirty] of shapes) {
+      const before = await media.metadataReport(file, family);
+      const c = await call('/strip-metadata', await readFile(file));
+      const out = c.uploaded && await writeTmp(c.uploaded, `.${family}`);
+      const rep = out && await media.metadataReport(out, family);
+      const chans = out && Number((await sh('ffprobe', ['-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=channels', '-of', 'csv=p=0', out])).trim());
+      // MP3: every audio packet byte-identical (a stream copy). Not PCM: the remux's Info frame makes a decoder skip the
+      // encoder's 529-sample start delay, which a file without one (Logic's) is decoded with. WAV: PCM identical.
+      const pcm = out && (family === 'mp3' ? (await packetHash(file)) === (await packetHash(out)) : await samePcm(file, c.uploaded));
+      if (out) await rm(out, { force: true });
+      check(`${label}: ${dirty ? 'dirty before; ' : ''}200 (exact shape), written back clean, still stereo, ${family === 'mp3' ? 'audio packets' : 'PCM'} identical, no tag text left`,
+        before.clean === !dirty && c.r.statusCode === 200 && exact(c.json) && rep?.clean && chans === 2 && pcm
+          && !['Fixtureville', 'Logic Pro', 'iTunSMPB'].some((s) => c.uploaded.includes(Buffer.from(s, 'latin1'))),
+        `${c.r.statusCode} ${c.r.body.slice(0, 140)} before=${JSON.stringify(before)} after=${JSON.stringify(rep)} channels=${chans}`);
+    }
+    // the allowance's two edges (the Reviewer on worker #4): exactly `Lavf`, and only for MP3. The positive control first.
+    check('positive control: an MP3 stream tagged encoder=Lavf (the remux\'s own, bitexact) is structural', media.badStreamTags({ encoder: 'Lavf' }, 'mp3').length === 0);
+    const otherValues = ['Lavf62.3.100', 'LAME3.100', 'Lavf Fixtureville', 'lavf', ' Lavf', 'Lavf\n', ''];
+    check(`an MP3 stream whose encoder is anything else (${otherValues.map((v) => JSON.stringify(v)).join(', ')}) → reported`, otherValues.every((v) => JSON.stringify(media.badStreamTags({ encoder: v }, 'mp3')) === '["encoder"]'));
+    const families = ['wav', 'flac', 'ogg', 'matroska', 'iso'];
+    check(`encoder=Lavf on a stream of any other family (${families.join(', ')}) → reported`, families.every((f) => JSON.stringify(media.badStreamTags({ encoder: 'Lavf' }, f)) === '["encoder"]'));
+    // Comma's item 4, on its own: the ID3 v2.2 tag is seen, and then it's gone — no tag header, none of its frames' text
+    const before22 = await media.metadataReport(logic22, 'mp3');
+    const c22 = await call('/strip-metadata', await readFile(logic22));
+    check('ID3 v2.2 (Logic): found before (the header + its frames read as tags); after, no ID3 header at the start and no frame text anywhere',
+      before22.leftovers.includes('id3v2') && before22.formatTags > 0 && c22.r.statusCode === 200 && c22.uploaded.subarray(0, 3).toString('latin1') !== 'ID3'
+        && !['Fixtureville', 'Logic Pro 12.3.1', 'iTunSMPB'].some((s) => c22.uploaded.includes(Buffer.from(s, 'latin1'))),
+      `${JSON.stringify(before22)} ${c22.r.statusCode}`);
+  }
+  {
+    // Astra's P1 on worker #4 (2026-10-31): ID3v2 tags BETWEEN frames or AFTER the audio — v2.2, v2.3, v2.4 with its
+    // footer — in mono and stereo. ffmpeg's demuxer resyncs past them and a lossless copy keeps them, while the old
+    // check (an ID3v2 header at byte 0) called the output clean. Now the input is rebuilt from its frames
+    // (lib/mp3Frames: tags dropped, anything unaccounted for refused) and the output is walked frame by frame.
+    const mp3Frames = require('../lib/mp3Frames');
+    const syncsafe4 = (n) => Buffer.from([(n >> 21) & 0x7f, (n >> 14) & 0x7f, (n >> 7) & 0x7f, n & 0x7f]);
+    const id3 = {
+      'v2.2': (text) => { const body = Buffer.concat([Buffer.from('TT2', 'latin1'), Buffer.from([0, 0, text.length + 1, 0]), Buffer.from(text, 'latin1')]); return Buffer.concat([Buffer.from('ID3\x02\x00\x00', 'latin1'), syncsafe4(body.length), body]); },
+      'v2.3': (text) => { const body = Buffer.concat([Buffer.from('TIT2', 'latin1'), Buffer.from([0, 0, 0, text.length + 1, 0, 0, 0]), Buffer.from(text, 'latin1')]); return Buffer.concat([Buffer.from('ID3\x03\x00\x00', 'latin1'), syncsafe4(body.length), body]); },
+      'v2.4 with a footer': (text) => { const body = Buffer.concat([Buffer.from('TIT2', 'latin1'), syncsafe4(text.length + 1), Buffer.from([0, 0, 3]), Buffer.from(text, 'latin1')]); return Buffer.concat([Buffer.from('ID3\x04\x00\x10', 'latin1'), syncsafe4(body.length), body, Buffer.from('3DI\x04\x00\x10', 'latin1'), syncsafe4(body.length)]); },
+    };
+    const remuxPlain = async (f) => { const o = `${f}.plain.mp3`; await sh('ffmpeg', ['-v', 'error', '-i', f, '-map', '0:a', '-c', 'copy', '-map_metadata', '-1', '-id3v2_version', '0', '-write_id3v1', '0', '-fflags', '+bitexact', o]); const b = await readFile(o); await rm(o, { force: true }); return b; };
+    const channels = async (f) => Number((await sh('ffprobe', ['-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=channels', '-of', 'csv=p=0', f])).trim());
+    const SECRET = 'Fixtureville GPS 51.5 -0.1';
+    for (const ch of [1, 2]) {
+      const who = ch === 1 ? 'mono' : 'stereo';
+      const plain = path.join(tmp, `placed-${who}.mp3`);
+      await sh('ffmpeg', [...tone, '-ac', String(ch), '-c:a', 'libmp3lame', '-b:a', '128k', '-id3v2_version', '0', '-write_id3v1', '0', plain]);
+      const pb = await readFile(plain);
+      const at = Number((await sh('ffprobe', ['-v', 'error', '-select_streams', 'a', '-show_entries', 'packet=pos', '-of', 'csv=p=0', plain])).trim().split('\n')[20]);
+      const positive = await call('/strip-metadata', pb);
+      const posOut = positive.uploaded && await writeTmp(positive.uploaded, '.mp3');
+      check(`clean ${who} MP3 (positive control): frames only before (the walk finds nothing), 200, clean after, ${who}, audio packets identical`,
+        (await media.metadataReport(plain, 'mp3')).leftovers.length === 0 && positive.r.statusCode === 200 && exact(positive.json) && (await media.metadataReport(posOut, 'mp3')).clean && (await channels(posOut)) === ch && (await packetHash(plain)) === (await packetHash(posOut)),
+        `${positive.r.statusCode} ${positive.r.body.slice(0, 120)}`);
+      if (posOut) await rm(posOut, { force: true });
+      for (const [version, make] of Object.entries(id3)) {
+        for (const [place, build] of [['between frames', (t) => Buffer.concat([pb.subarray(0, at), t, pb.subarray(at)])], ['after the audio', (t) => Buffer.concat([pb, t])]]) {
+          const f = path.join(tmp, `placed-${who}-${version.replace(/\W+/g, '')}-${place.replace(/\W+/g, '')}.mp3`);
+          await writeFile(f, build(make(SECRET)));
+          const kept = (await remuxPlain(f)).includes(Buffer.from(SECRET, 'latin1')); // the gap, shown on this very file
+          const before = await media.metadataReport(f, 'mp3');
+          const c = await call('/strip-metadata', await readFile(f));
+          const out = c.uploaded && await writeTmp(c.uploaded, '.mp3');
+          const after = out && await media.metadataReport(out, 'mp3');
+          check(`ID3 ${version} ${place}, ${who}: a plain remux keeps it; seen before (id3v2); 200, written back with no tag and no tag text, clean frame to frame, ${who}, audio packets identical to the untagged file`,
+            kept && JSON.stringify(before.leftovers) === '["id3v2"]' && c.r.statusCode === 200 && exact(c.json) && after?.clean && !c.uploaded.includes(Buffer.from('Fixtureville')) && !c.uploaded.includes(Buffer.from('3DI', 'latin1'))
+              && (await channels(out)) === ch && (await packetHash(plain)) === (await packetHash(out)),
+            `kept=${kept} before=${JSON.stringify(before)} ${c.r.statusCode} ${c.r.body.slice(0, 120)} after=${JSON.stringify(after)}`);
+          if (out) await rm(out, { force: true });
+        }
+      }
+      // bytes that are neither a frame nor a tag: REFUSED (415 mp3-structure, with where), nothing written, no temp dir left
+      const junk = Buffer.from(`${SECRET} private notes, not a tag`, 'latin1');
+      const huge = Buffer.concat([Buffer.from('ID3\x03\x00\x00', 'latin1'), syncsafe4(50 * 1024 * 1024), Buffer.from(SECRET, 'latin1')]); // a tag whose size runs past the end
+      const lyrics1 = Buffer.from(`LYRICSBEGIN${SECRET}LYRICSEND`, 'latin1'); // Lyrics3 v1: no size to skip by
+      for (const [label, bytes, where] of [['unparsed bytes between frames', Buffer.concat([pb.subarray(0, at), junk, pb.subarray(at)]), at], ['unparsed bytes after the audio', Buffer.concat([pb, junk]), pb.length], ['an ID3 header whose size runs past the end, between frames', Buffer.concat([pb.subarray(0, at), huge, pb.subarray(at)]), at], ['a Lyrics3 v1 block after the audio', Buffer.concat([pb, lyrics1]), pb.length]]) {
+        const dirsBefore = (await jobDirs()).length;
+        const c = await call('/strip-metadata', bytes);
+        check(`${label}, ${who} → REFUSED 415 {error: mp3-structure, detail: {at: ${where}}}, nothing written, no temp dir left`,
+          c.r.statusCode === 415 && JSON.stringify(c.json) === JSON.stringify({ error: 'mp3-structure', detail: { at: where } }) && c.uploaded === null && (await jobDirs()).length === dirsBefore,
+          `${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
+      }
+      // what it does drop without refusing: zero padding after a leading tag, and a cut-off last frame
+      const padded = Buffer.concat([id3['v2.3'](SECRET), Buffer.alloc(300), pb.subarray(0, pb.length - 100)]);
+      const cp = await call('/strip-metadata', padded);
+      const cpOut = cp.uploaded && await writeTmp(cp.uploaded, '.mp3');
+      check(`a leading tag, 300 zero bytes, a cut-off last frame, ${who}: 200, the tag, the zeros and the cut frame gone, clean frame to frame`,
+        cp.r.statusCode === 200 && !cp.uploaded.includes(Buffer.from('Fixtureville')) && (await media.metadataReport(cpOut, 'mp3')).clean, `${cp.r.statusCode} ${cp.r.body.slice(0, 120)}`);
+      if (cpOut) await rm(cpOut, { force: true });
+    }
+    // the OUTPUT walk stands on its own: with the input rebuild sabotaged into a plain copy, a tag between frames
+    // reaches the remux, ffmpeg keeps it, and the output walk refuses — 500 metadata-survived, nothing written
+    {
+      const plain = path.join(tmp, 'placed-stereo.mp3');
+      const pb = await readFile(plain);
+      const at = Number((await sh('ffprobe', ['-v', 'error', '-select_streams', 'a', '-show_entries', 'packet=pos', '-of', 'csv=p=0', plain])).trim().split('\n')[20]);
+      const realSanitize = media.sanitizeMp3;
+      media.sanitizeMp3 = async (i, o) => { await copyFile(i, o); return { frames: 0, removed: {} }; };
+      let c;
+      try { c = await call('/strip-metadata', Buffer.concat([pb.subarray(0, at), id3['v2.3'](SECRET), pb.subarray(at)])); } finally { media.sanitizeMp3 = realSanitize; }
+      check('with the input rebuild sabotaged, the OUTPUT walk refuses: 500 metadata-survived (1 leftover), nothing written (fails if the strict walk is removed)',
+        c.r.statusCode === 500 && c.json?.error === 'metadata-survived' && c.json.detail?.leftovers === 1 && c.uploaded === null, `${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
+    }
+    // the output walk's own edges, on bytes: frames only is clean; one extra zero byte, a cut last frame, a trailing tag are not
+    {
+      const frames = await readFile(path.join(tmp, 'placed-mono.mp3'));
+      const walk = async (buf) => { const f = await writeTmp(buf, '.mp3'); const r = await mp3Frames.mp3Leftovers(f); await rm(f, { force: true }); return JSON.stringify(r); };
+      const got = [await walk(frames), await walk(Buffer.concat([frames, Buffer.alloc(1)])), await walk(frames.subarray(0, frames.length - 10)), await walk(Buffer.concat([frames, id3['v2.4 with a footer']('x')])), await walk(Buffer.concat([Buffer.alloc(1), frames]))];
+      check('the output walk: frames only → []; +1 zero byte → mp3-unparsed; last frame cut → mp3-short-frame; a v2.4 tag after → id3v2; a zero byte first → mp3-unparsed',
+        JSON.stringify(got) === JSON.stringify(['[]', '["mp3-unparsed"]', '["mp3-short-frame"]', '["id3v2"]', '["mp3-unparsed"]']), JSON.stringify(got));
+    }
+  }
+  {
     // Ogg/Opus whose comment-header vendor is free text (same length as "ffmpeg", so the file stays valid)
     const f = path.join(tmp, 'vendor.ogg');
     await sh('ffmpeg', [...tone, '-c:a', 'libopus', f]);
@@ -345,7 +491,7 @@ async function endpoints() {
     sei.neutralizeSeiInIso = async () => ({ neutralized: 0, refused: null });
     let sab;
     try { sab = await call('/strip-metadata', await readFile(ud)); } finally { sei.neutralizeSeiInIso = realNeutralize; }
-    check('with the neutralizer sabotaged, the OUTPUT re-scan refuses: 500 "private data survived", nothing written (fails if verifySei is removed)', sab.r.statusCode === 500 && sab.uploaded === null && /private data survived/.test(sab.json?.error || ''), `${sab.r.statusCode} ${sab.r.body.slice(0, 120)}`);
+    check('with the neutralizer sabotaged, the OUTPUT re-scan refuses: 500 private-sei-survived, nothing written (fails if verifySei is removed)', sab.r.statusCode === 500 && sab.uploaded === null && sab.json?.error === 'private-sei-survived', `${sab.r.statusCode} ${sab.r.body.slice(0, 120)}`);
     const co = await call('/strip-metadata', await readFile(orient));
     check('private data in the SAME SEI NAL as picture-relevant SEI (display orientation) → REFUSED (415), nothing written', co.r.statusCode === 415 && co.uploaded === null, `${co.r.statusCode} ${co.r.body.slice(0, 120)}`);
     const ch = await call('/strip-metadata', await readFile(hevc));
@@ -412,7 +558,7 @@ async function endpoints() {
     await sh('ffmpeg', ['-v', 'error', '-framerate', '25', '-f', 'h264', '-i', mixedEs, '-c', 'copy', mixed]);
     const mIn = await sei.seiReport(mixed, 'h264', tmp);
     const cm = await call('/strip-metadata', await readFile(mixed));
-    check('private user data in the SAME SEI NAL as picture_timing → REFUSED (415), nothing written', mIn.refuseNals === 1 && cm.r.statusCode === 415 && cm.uploaded === null && /picture-relevant|shares/.test(cm.json?.error || ''), `${JSON.stringify(mIn)} ${cm.r.statusCode} ${cm.r.body.slice(0, 120)}`);
+    check('private user data in the SAME SEI NAL as picture_timing → REFUSED (415), nothing written', mIn.refuseNals === 1 && cm.r.statusCode === 415 && cm.uploaded === null && cm.json?.error === 'private-sei-refused', `${JSON.stringify(mIn)} ${cm.r.statusCode} ${cm.r.body.slice(0, 120)}`);
     // HDR10+ (x265's own, read by ffmpeg as SMPTE 2094-40): kept; x265's private settings message gone
     const ch = await call('/strip-metadata', await readFile(FIX('hdr.mp4')));
     const hOut = ch.uploaded && await writeTmp(ch.uploaded, '.mp4');
@@ -429,25 +575,25 @@ async function endpoints() {
     const [dA, dV] = [await declared(squeezedAudio), await declared(squeezedVideo)];
     const withEnv = async (k, v, fn) => { process.env[k] = v; try { return await fn(); } finally { delete process.env[k]; } };
     const e1 = await withEnv('ENHANCE_MAX_DURATION_SEC', '10', () => call('/enhance', fs.readFileSync(squeezedAudio), { body: { enhancementType: 'clean' } }));
-    check(`enhance: 30 s of audio with timestamps squeezed ×10 (declares ${dA.toFixed(1)} s), cap 10 s → 413 measured by SAMPLES (~11 s counted, then stopped)`, dA < 4 && e1.r.statusCode === 413 && /measured: 1[01]\.\d\+ s of audio/.test(e1.json?.error || '') && e1.uploaded === null, `${e1.r.statusCode} ${e1.r.body.slice(0, 140)}`);
+    check(`enhance: 30 s of audio with timestamps squeezed ×10 (declares ${dA.toFixed(1)} s), cap 10 s → 413 measured by SAMPLES (~11 s counted, then stopped)`, dA < 4 && e1.r.statusCode === 413 && e1.json?.error === 'duration-over-cap' && e1.json.detail.audioSec >= 10 && e1.json.detail.audioSec < 12 && e1.json.detail.frames === undefined && e1.uploaded === null, `${e1.r.statusCode} ${e1.r.body.slice(0, 140)}`);
     const s1 = await withEnv('STRIP_MAX_DURATION_SEC', '10', () => call('/strip-metadata', fs.readFileSync(squeezedAudio)));
-    check('strip: the same squeezed audio, cap 10 s → 413 measured by samples', s1.r.statusCode === 413 && /measured/.test(s1.json?.error || '') && s1.uploaded === null, `${s1.r.statusCode} ${s1.r.body.slice(0, 140)}`);
+    check('strip: the same squeezed audio, cap 10 s → 413 measured by samples', s1.r.statusCode === 413 && s1.json?.error === 'duration-over-cap' && s1.json.detail.audioSec > 10 && s1.uploaded === null, `${s1.r.statusCode} ${s1.r.body.slice(0, 140)}`);
     const t1 = await withEnv('TRANSCODE_MAX_DURATION_SEC', '20', () => call('/transcode-video', fs.readFileSync(squeezedVideo)));
-    check(`transcode: 1800 frames with timestamps squeezed ×10 (declares ${dV.toFixed(1)} s), cap 20 s → 413 by FRAME COUNT (budget 20 × 60)`, dV < 7 && t1.r.statusCode === 413 && /measured: \d{4}\+ frames/.test(t1.json?.error || '') && t1.uploaded === null, `${t1.r.statusCode} ${t1.r.body.slice(0, 140)}`);
+    check(`transcode: 1800 frames with timestamps squeezed ×10 (declares ${dV.toFixed(1)} s), cap 20 s → 413 by FRAME COUNT (budget 20 × 60)`, dV < 7 && t1.r.statusCode === 413 && t1.json?.error === 'duration-over-cap' && t1.json.detail.frames >= 1000 && t1.uploaded === null, `${t1.r.statusCode} ${t1.r.body.slice(0, 140)}`);
     // 601 s, duration-less live WebM (ordinary MediaRecorder output) through transcode — with audio, and picture-only
     const live = path.join(tmp, 'live601.webm'), liveV = path.join(tmp, 'live601v.webm');
     await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'testsrc=duration=601:size=32x32:rate=5', '-f', 'lavfi', '-i', 'sine=duration=601', '-c:v', 'libvpx', '-b:v', '20k', '-c:a', 'libopus', '-b:a', '16k', '-live', '1', '-f', 'webm', live]);
     await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'testsrc=duration=601:size=32x32:rate=5', '-c:v', 'libvpx', '-b:v', '20k', '-live', '1', '-f', 'webm', liveV]);
     const noDur = async (f) => { const d = (await sh('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', f])).trim(); return d === '' || d === 'N/A'; };
     const t2 = await call('/transcode-video', fs.readFileSync(live), { type: 'video/webm' });
-    check('transcode: a 601 s live WebM with NO declared duration (video + audio), cap 600 s → 413 — over by samples AND by timestamp span, nothing written', (await noDur(live)) && t2.r.statusCode === 413 && /601\.\d\+ s of audio/.test(t2.json?.error || '') && /timestamps span 601\.\d s/.test(t2.json?.error || '') && t2.uploaded === null, `${t2.r.statusCode} ${t2.r.body.slice(0, 140)}`);
+    check('transcode: a 601 s live WebM with NO declared duration (video + audio), cap 600 s → 413 — over by samples AND by timestamp span, nothing written', (await noDur(live)) && t2.r.statusCode === 413 && t2.json?.error === 'duration-over-cap' && t2.json.detail.audioSec >= 601 && t2.json.detail.audioSec < 603 && t2.json.detail.spanSec >= 601 && t2.json.detail.spanSec < 602 && t2.uploaded === null, `${t2.r.statusCode} ${t2.r.body.slice(0, 140)}`);
     const t3 = await call('/transcode-video', fs.readFileSync(liveV), { type: 'video/webm' });
-    check('transcode: a picture-only 5-fps live WebM, 601 s with NO declared duration (3005 frames — far under the frame budget) → 413 BEFORE any transcoding, by its timestamp span; nothing written', (await noDur(liveV)) && t3.r.statusCode === 413 && /Source exceeds the 600s cap \(measured: timestamps span 601\.\d s\)/.test(t3.json?.error || '') && t3.uploaded === null, `${t3.r.statusCode} ${t3.r.body.slice(0, 140)}`);
+    check('transcode: a picture-only 5-fps live WebM, 601 s with NO declared duration (3005 frames — far under the frame budget) → 413 BEFORE any transcoding, by its timestamp span; nothing written', (await noDur(liveV)) && t3.r.statusCode === 413 && t3.json?.error === 'duration-over-cap' && t3.json.detail.spanSec >= 601 && t3.json.detail.spanSec < 602 && t3.json.detail.audioSec === undefined && t3.json.detail.frames === undefined && t3.uploaded === null, `${t3.r.statusCode} ${t3.r.body.slice(0, 140)}`);
     // strip: hard byte limit (-fs) and exact packet counts
     const song = path.join(tmp, 'song.mp3');
     await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'sine=duration=30', '-c:a', 'libmp3lame', '-b:a', '128k', song]);
     const s2 = await withEnv('STRIP_MAX_OUTPUT_BYTES', '100000', () => call('/strip-metadata', fs.readFileSync(song)));
-    const stopped = Number(/stopped at (\d+) bytes/.exec(s2.json?.error || '')?.[1]);
+    const stopped = s2.json?.error === 'output-over-cap' ? s2.json.detail?.bytes : NaN;
     check(`strip: output over its byte cap (30 s mp3 ≈ 480 KB, cap 100 KB) → 413, -fs STOPPED it at ${stopped} bytes (≤ cap + 64 KB; fails if -fs is removed)`, s2.r.statusCode === 413 && stopped >= 100000 && stopped <= 100000 + 65536 && s2.uploaded === null, `${s2.r.statusCode} ${s2.r.body.slice(0, 140)}`);
     const src = await readFile(require.resolve('../index.js'), 'utf8');
     check('no ffmpeg run trusts a timestamp limit or a declared duration (no -t, no format.duration)', !/'-t'|-t \$\{|format\?\.duration|format\.duration/.test(src));
@@ -486,7 +632,7 @@ async function endpoints() {
     await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'sine=duration=2', '-f', 'lavfi', '-i', 'sine=duration=30:frequency=880', '-map', '0', '-map', '1', '-c:a', 'libopus', two]);
     process.env.STRIP_MAX_DURATION_SEC = '10';
     let c; try { c = await call('/strip-metadata', fs.readFileSync(two)); } finally { delete process.env.STRIP_MAX_DURATION_SEC; }
-    check('strip: first audio stream 2 s, SECOND 30 s, cap 10 s → 413, the second stream measured', c.r.statusCode === 413 && /audio stream 2/.test(c.json?.error || '') && c.uploaded === null, `${c.r.statusCode} ${c.r.body.slice(0, 160)}`);
+    check('strip: first audio stream 2 s, SECOND 30 s, cap 10 s → 413, the second stream measured', c.r.statusCode === 413 && c.json?.error === 'duration-over-cap' && c.json.detail.stream === 2 && c.uploaded === null, `${c.r.statusCode} ${c.r.body.slice(0, 160)}`);
   }
   {
     // each HARD limit on its own: the real command line (lib/commands) on an input over its cap — the measuring that normally refuses such input first is bypassed
@@ -581,7 +727,7 @@ async function endpoints() {
     const c = await call('/strip-metadata', grown);
     const after = await jobDirs();
     check(`Annex-B expansion: a ${(size / 1024).toFixed(0)} KB HEVC MP4, ${frames} keyframes, a 240 KB user-data SEI in hvcC — repeated before every keyframe, it expands past the ${(budget / 1048576).toFixed(2)} MB OS file-size budget → 413, cleanly: nothing written, no temp dir left`,
-      frames === 200 && c.r.statusCode === 413 && /expands past/.test(c.json?.error || '') && c.uploaded === null && after.length === before.length, `${frames} ${c.r.statusCode} ${c.r.body.slice(0, 140)}`);
+      frames === 200 && c.r.statusCode === 413 && c.json?.error === 'sei-expands' && c.uploaded === null && after.length === before.length, `${frames} ${c.r.statusCode} ${c.r.body.slice(0, 140)}`);
     await rm(exp, { force: true });
   }
   {
@@ -591,7 +737,7 @@ async function endpoints() {
     const pk = await require('../lib/limits').packetCounts(far, ['-map', '0:a'], Infinity, 60_000);
     const c = await call('/strip-metadata', fs.readFileSync(far));
     check(`two ONE-second audio tracks, starting at 0 and 15000 s (each track's own span ${pk.spans.map((x) => x.toFixed(1)).join(' / ')} s; combined ${pk.spanSec?.toFixed(0)} s) → refused by the combined span (cap 4 h), nothing written`,
-      pk.spans.every((x) => x < 2) && pk.spanSec > 15000 && c.r.statusCode === 413 && /timestamps span 1500\d/.test(c.json?.error || '') && c.uploaded === null, `${c.r.statusCode} ${c.r.body.slice(0, 160)}`);
+      pk.spans.every((x) => x < 2) && pk.spanSec > 15000 && c.r.statusCode === 413 && c.json?.error === 'duration-over-cap' && c.json.detail.spanSec >= 15000 && c.json.detail.spanSec < 15010 && c.uploaded === null, `${c.r.statusCode} ${c.r.body.slice(0, 160)}`);
   }
   {
     // 2 — the closed input rule: playlists and indirection lists are refused BEFORE ffmpeg runs (no process, so no network and no out-of-directory read)
@@ -617,8 +763,8 @@ async function endpoints() {
     } finally {
       proc.run = realRun;
     }
-    const bad = results.filter((x) => x.status !== 415 || x.ran !== 0 || x.uploaded || !/Not an accepted media container/.test(x.error || ''));
-    check(`playlists and indirection lists (HLS ×2, ffconcat, concat, SDP) on all three endpoints → 415 "Not an accepted media container", and NO ffmpeg / ffprobe process started (${results.length} cases)`, bad.length === 0 && results.length === 15, JSON.stringify(bad.slice(0, 2)));
+    const bad = results.filter((x) => x.status !== 415 || x.ran !== 0 || x.uploaded || x.error !== 'input-refused');
+    check(`playlists and indirection lists (HLS ×2, ffconcat, concat, SDP) on all three endpoints → 415 input-refused, and NO ffmpeg / ffprobe process started (${results.length} cases)`, bad.length === 0 && results.length === 15, JSON.stringify(bad.slice(0, 2)));
     // the guard itself (lib/proc): every input shape that isn't exactly ours is refused before a process starts
     const jd = await mkdtemp(path.join(os.tmpdir(), 'wt-guard-'));
     const ok = path.join(jd, 'in.wav');
@@ -700,7 +846,7 @@ async function endpoints() {
     process.env.ENHANCE_MAX_DURATION_SEC = '5';
     const d = await call('/enhance', await readFile(long), { body: { enhancementType: 'clean' } });
     delete process.env.ENHANCE_MAX_DURATION_SEC;
-    check('enhance: a 10 s input with a 5 s cap → 413 (measured) before any processing, nothing written', d.r.statusCode === 413 && /measured/.test(d.json?.error || '') && d.uploaded === null, `${d.r.statusCode} ${d.r.body.slice(0, 100)}`);
+    check('enhance: a 10 s input with a 5 s cap → 413 (measured) before any processing, nothing written', d.r.statusCode === 413 && d.json?.error === 'duration-over-cap' && d.json.detail.audioSec > 5 && d.uploaded === null, `${d.r.statusCode} ${d.r.body.slice(0, 100)}`);
     // a container that declares NO duration (live WebM, like MediaRecorder's): measured, not trusted
     const live = path.join(tmp, 'live.webm');
     await sh('ffmpeg', ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'sine=duration=10', '-c:a', 'libopus', '-live', '1', '-f', 'webm', live]);
@@ -708,14 +854,14 @@ async function endpoints() {
     process.env.ENHANCE_MAX_DURATION_SEC = '5';
     const lv = await call('/enhance', await readFile(live), { body: { enhancementType: 'clean' } });
     delete process.env.ENHANCE_MAX_DURATION_SEC;
-    check(`enhance: 10 s of audio whose container declares ${declared === undefined ? 'NO' : declared + ' s of'} duration → MEASURED, 413 (measured), nothing written`, (declared === undefined || declared === 'N/A') && lv.r.statusCode === 413 && /measured/.test(lv.json?.error || '') && lv.uploaded === null, `${declared} ${lv.r.statusCode} ${lv.r.body.slice(0, 100)}`);
+    check(`enhance: 10 s of audio whose container declares ${declared === undefined ? 'NO' : declared + ' s of'} duration → MEASURED, 413 (measured), nothing written`, (declared === undefined || declared === 'N/A') && lv.r.statusCode === 413 && lv.json?.error === 'duration-over-cap' && lv.uploaded === null, `${declared} ${lv.r.statusCode} ${lv.r.body.slice(0, 100)}`);
     // 30 s → ~2.9 MB of WAV; cap 1 MB. (Longer than loudnorm's 3 s look-ahead, so output streams and -fs can act.)
     const thirty = path.join(tmp, 'thirty.mp3');
     await sh('ffmpeg', ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'sine=duration=30', '-c:a', 'libmp3lame', '-b:a', '8k', thirty]);
     process.env.ENHANCE_MAX_OUTPUT_BYTES = '1000000';
     const o = await call('/enhance', await readFile(thirty), { body: { enhancementType: 'clean' } });
     delete process.env.ENHANCE_MAX_OUTPUT_BYTES;
-    const stopped = Number(/stopped at (\d+) bytes/.exec(o.json?.error || '')?.[1]);
+    const stopped = o.json?.error === 'output-over-cap' ? o.json.detail?.bytes : NaN;
     check(`enhance: an output over the byte cap (30 s → ~2.9 MB, cap 1 MB) → 413, and ffmpeg's -fs STOPPED writing at ${stopped} bytes (≤ cap + 64 KB — without -fs it would be ~2.9 MB), nothing written`, o.r.statusCode === 413 && o.uploaded === null && stopped >= 1000000 && stopped <= 1000000 + 65536, `${o.r.statusCode} ${o.r.body.slice(0, 120)}`);
     const ok = await call('/enhance', await readFile(short), { body: { enhancementType: 'clean' } });
     check('enhance within the caps: 200, and the upload is STREAMED (a ReadableStream body, duplex half, exact Content-Length)', ok.r.statusCode === 200 && ok.uploadInit?.duplex === 'half' && !Buffer.isBuffer(ok.uploadInit?.body) && typeof ok.uploadInit?.body?.getReader === 'function' && Number(ok.uploadHeaders?.['Content-Length']) === ok.uploaded?.length, `${ok.r.statusCode} ${JSON.stringify(ok.uploadHeaders)}`);
@@ -778,7 +924,7 @@ async function endpoints() {
     media.blankMetadataBoxes = async () => 0;
     try {
       const c = await call('/strip-metadata', await readFile(FIX('gps-video.mov')));
-      check('with the strip sabotaged, the OUTPUT VERIFICATION refuses: 500 and nothing written back (fails if verifyClean is removed)', c.r.statusCode === 500 && c.uploaded === null && /metadata survived/.test(c.json?.error || ''), `${c.r.statusCode} ${c.r.body.slice(0, 160)}`);
+      check('with the strip sabotaged, the OUTPUT VERIFICATION refuses: 500 and nothing written back (fails if verifyClean is removed)', c.r.statusCode === 500 && c.uploaded === null && c.json?.error === 'metadata-survived', `${c.r.statusCode} ${c.r.body.slice(0, 160)}`);
     } finally {
       media.stripMedia = realStrip;
       media.blankMetadataBoxes = realBlank;
@@ -786,7 +932,7 @@ async function endpoints() {
   }
   {
     const c = await call('/strip-metadata', () => new Response(null, { status: 302, headers: { location: 'https://evil.example/x.mp4' } }));
-    check('the source redirects (302) → refused (500), nothing written', c.r.statusCode === 500 && c.uploaded === null && /redirect/.test(c.json?.error || ''), c.r.body.slice(0, 120));
+    check('the source redirects (302) → refused (500), nothing written', c.r.statusCode === 500 && c.uploaded === null && c.json?.error === 'redirect-refused' && c.json.detail?.status === 302, c.r.body.slice(0, 120));
   }
   {
     const c = await call('/strip-metadata', await readFile(FIX('gps-video.mp4')), { upload: () => new Response(null, { status: 307, headers: { location: 'https://evil.example/' } }) });
@@ -846,6 +992,45 @@ async function endpoints() {
     check('enhance: a redirecting source → refused', c.r.statusCode === 500 && c.uploaded === null);
   }
 
+  {
+    // Astra's P2 on #781 (2026-10-31): a failure leaves the worker as ONE listed code and numbers only — never an
+    // error's text, which can carry ffmpeg's stderr, storage's reply, a person's path or a credential. Synthetic
+    // sensitive markers are put INSIDE each failure; none may reach the reply or the log.
+    const errors = require('../lib/errors');
+    const proc = require('../lib/proc');
+    const MARKERS = ['/Users/Jane Doe/Music/private demo.mp3', 'sk_live_FIXTURE0000', 'eyJhbGciOiJIUzI1NiJ9.FIXTURE', 'Fixtureville', 'token=SECRETTOKEN'];
+    const loud = MARKERS.join(' ');
+    const shapeOk = (j) => !!j && typeof j.error === 'string' && Object.prototype.hasOwnProperty.call(errors.CODES, j.error)
+      && Object.keys(j).every((k) => k === 'error' || k === 'detail')
+      && (j.detail === undefined || Object.entries(j.detail).every(([k, v]) => errors.DETAIL_KEYS.has(k) && typeof v === 'number' && Number.isFinite(v)));
+    const clean = (c) => !MARKERS.some((m) => c.r.body.includes(m) || c.logs.includes(m));
+    const cases = [];
+    cases.push(['storage refuses the write-back with a reply full of private text', 'upload-failed', await call('/strip-metadata', await readFile(wav), { upload: () => new Response(loud, { status: 400 }) }), (j) => j.detail?.status === 400]);
+    cases.push(['the source download fails (404) with private text in the body', 'download-failed', await call('/strip-metadata', () => new Response(loud, { status: 404 })), (j) => j.detail?.status === 404]);
+    const sabotage = async (label, code, err) => {
+      const real = media.stripMedia;
+      media.stripMedia = async () => { throw err; };
+      try { cases.push([label, code, await call('/strip-metadata', await readFile(wav)), () => true]); } finally { media.stripMedia = real; }
+    };
+    await sabotage('ffmpeg fails with private text on its stderr (a real ProcError, tagged by proc.run)', 'ffmpeg-failed', errors.tag(new proc.ProcError(`ffmpeg failed (exit 1): ${loud}`), 'ffmpeg-failed', { exit: 1 }));
+    await sabotage('an untagged ProcError carrying private text', 'ffmpeg-failed', new proc.ProcError(`ffmpeg failed: ${loud}`));
+    await sabotage('an unexpected error carrying private text', 'internal', new Error(loud));
+    await sabotage('an error tagged with a string and an unlisted name in its detail', 'ffmpeg-failed', errors.tag(new Error(loud), 'ffmpeg-failed', { exit: 1, path: loud, status: loud, capBytes: Infinity }));
+    for (const [label, code, c, more] of cases) {
+      check(`${label} → ${c.r.statusCode} {error: ${code}${c.json?.detail ? `, detail ${JSON.stringify(c.json.detail)}` : ''}}: a listed code, numbers only, no marker in the reply or the log${code === 'upload-failed' ? '' : ', nothing written'}`,
+        c.json?.error === code && c.r.statusCode === errors.CODES[code] && shapeOk(c.json) && more(c.json) && clean(c) && (code === 'upload-failed' || c.uploaded === null), `${c.r.statusCode} ${c.r.body.slice(0, 200)}`);
+    }
+    const strings = cases.find(([l]) => l.startsWith('an error tagged with a string'))[2].json;
+    check('a detail keeps only listed names with finite numbers ({exit: 1}; the path, a string status and Infinity dropped)', JSON.stringify(strings) === JSON.stringify({ error: 'ffmpeg-failed', detail: { exit: 1 } }), JSON.stringify(strings));
+    let unknown = null; try { errors.tag(new Error('x'), 'made-up-code'); } catch (e) { unknown = e; }
+    check('tagging with a code that isn\'t listed throws (a typo can\'t send an unlisted code)', unknown !== null);
+    check('every code is lowercase words and dashes, and goes out with a 4xx or 5xx status', Object.entries(errors.CODES).every(([k, v]) => /^[a-z0-9]+(-[a-z0-9]+)*$/.test(k) && v >= 400 && v < 600));
+    // the secret gate's own replies are codes too
+    const noSecret = await app.inject({ method: 'POST', url: '/strip-metadata', payload: {} });
+    check('no secret → 401 {error: unauthorized}', noSecret.statusCode === 401 && noSecret.body === '{"error":"unauthorized"}', noSecret.body);
+    const badBody = await app.inject({ method: 'POST', url: '/strip-metadata', headers: H, payload: { sourceUrl: `https://evil.example/${MARKERS[0]}`, uploadUrl: 'x' } });
+    check('a refused request body → 400 {error: bad-request}, the URL not echoed', badBody.statusCode === 400 && badBody.body === '{"error":"bad-request"}', badBody.body);
+  }
   const logs = allLogs.join('');
   check('logs carry bucket/key only — no URL, no token (finding 8)', logs.length > 0 && !/READTOKEN|WRITETOKEN|token=|https?:\/\//.test(logs) && logs.includes('media-incoming/0xabc/5f1e'), logs.slice(0, 200));
   check('no temp files left behind by any endpoint run (finding 6)', (await jobDirs()).length === 0, (await jobDirs()).join(','));
