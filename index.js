@@ -42,6 +42,18 @@ app.addHook('onRequest', async (request, reply) => {
   if (!secretOk(request.headers[SECRET_HEADER], secret)) return reply.status(401).send({ error: 'unauthorized' });
 });
 
+// Fastify's own errors (a body that isn't JSON, one too large, an unknown content
+// type…) leave as a code too: its default handler replies with the error's message
+// and logs it, and a JSON parse error's message quotes the body (the Reviewer's P3
+// on #4). A 4xx is bad-request, anything else internal; logged as code and status.
+app.setErrorHandler((error, request, reply) => {
+  const { status, body } = failure(error, (e) => (e.statusCode >= 400 && e.statusCode < 500 ? 'bad-request' : null));
+  const line = { route: request.routeOptions?.url ?? null, status, ...body };
+  if (status < 500) app.log.info(line, 'Request refused');
+  else app.log.error(line, 'Request failed');
+  reply.status(status).send(body);
+});
+
 // FFmpeg filter chains for each enhancement type
 // afftdn = FFT-based denoiser, nf = noise floor (dB), nr = noise reduction amount
 // crystalizer = transient/clarity enhancement, asubboost = bass boost

@@ -413,6 +413,22 @@ async function endpoints() {
       check('with the input rebuild sabotaged, the OUTPUT walk refuses: 500 metadata-survived (1 leftover), nothing written (fails if the strict walk is removed)',
         c.r.statusCode === 500 && c.json?.error === 'metadata-survived' && c.json.detail?.leftovers === 1 && c.uploaded === null, `${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
     }
+    // ...and holds it to ONE stream: 44.1 kHz frames then 48 kHz frames, every byte a frame, is refused by the input
+    // rebuild (415 at the first 48 kHz frame) and, with that rebuild sabotaged, by the output walk (the Reviewer's P3 on #4)
+    {
+      const part = async (rate) => { const f = path.join(tmp, `two-${rate}.mp3`); await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1', '-ac', '2', '-ar', String(rate), '-c:a', 'libmp3lame', '-b:a', '128k', '-write_xing', '0', '-id3v2_version', '0', '-write_id3v1', '0', f]); return readFile(f); };
+      const first = await part(44100);
+      const two = Buffer.concat([first, await part(48000)]);
+      const refused = await call('/strip-metadata', two);
+      check(`two streams (44.1 kHz then 48 kHz frames): 415 {error: mp3-structure, detail {at: ${first.length}}}, nothing written`,
+        refused.r.statusCode === 415 && JSON.stringify(refused.json) === JSON.stringify({ error: 'mp3-structure', detail: { at: first.length } }) && refused.uploaded === null, `${refused.r.statusCode} ${refused.r.body.slice(0, 120)}`);
+      const realSanitize = media.sanitizeMp3;
+      media.sanitizeMp3 = async (i, o) => { await copyFile(i, o); return { frames: 0, removed: {} }; };
+      let c;
+      try { c = await call('/strip-metadata', two); } finally { media.sanitizeMp3 = realSanitize; }
+      check('two streams with the input rebuild sabotaged: the OUTPUT walk refuses, 500 metadata-survived (1 leftover), nothing written (fails if the walk accepts a second stream)',
+        c.r.statusCode === 500 && c.json?.error === 'metadata-survived' && c.json.detail?.leftovers === 1 && c.uploaded === null, `${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
+    }
     // the output walk's own edges, on bytes: frames only is clean; one extra zero byte, a cut last frame, a trailing tag are not
     {
       const frames = await readFile(path.join(tmp, 'placed-mono.mp3'));
@@ -1030,6 +1046,23 @@ async function endpoints() {
     check('no secret → 401 {error: unauthorized}', noSecret.statusCode === 401 && noSecret.body === '{"error":"unauthorized"}', noSecret.body);
     const badBody = await app.inject({ method: 'POST', url: '/strip-metadata', headers: H, payload: { sourceUrl: `https://evil.example/${MARKERS[0]}`, uploadUrl: 'x' } });
     check('a refused request body → 400 {error: bad-request}, the URL not echoed', badBody.statusCode === 400 && badBody.body === '{"error":"bad-request"}', badBody.body);
+    // Fastify's own errors, before any handler runs: a body that isn't JSON (its parse error quotes the body) and an
+    // unknown content type. Captured at app.log as the jobs' logs are (the Reviewer's P3 on #4)
+    const fastifyLogs = [];
+    const realInfo = app.log.info, realError = app.log.error;
+    app.log.info = (...a) => { fastifyLogs.push(JSON.stringify(a)); };
+    app.log.error = (...a) => { fastifyLogs.push(JSON.stringify(a)); };
+    let notJson, oddType;
+    try {
+      notJson = await app.inject({ method: 'POST', url: '/strip-metadata', headers: { ...H, 'content-type': 'application/json' }, payload: `{"sourceUrl": "${loud}", oops` });
+      oddType = await app.inject({ method: 'POST', url: '/strip-metadata', headers: { ...H, 'content-type': 'text/x-fixture' }, payload: loud });
+    } finally { app.log.info = realInfo; app.log.error = realError; }
+    const fl = fastifyLogs.join('');
+    for (const [label, res] of [['a body that isn\'t JSON (its parse error quotes the body)', notJson], ['an unknown content type', oddType]]) {
+      check(`${label} → 400 {error: bad-request} exactly, logged as the code and status, no marker in the reply or the log`,
+        res.statusCode === 400 && res.body === '{"error":"bad-request"}' && !MARKERS.some((m) => res.body.includes(m) || fl.includes(m)), `${res.statusCode} ${res.body.slice(0, 160)}`);
+    }
+    check('both logged by the error handler: "Request refused", status 400, error bad-request', (fl.match(/"status":400,"error":"bad-request"\},"Request refused"/g) || []).length === 2, fl.slice(0, 300));
   }
   const logs = allLogs.join('');
   check('logs carry bucket/key only — no URL, no token (finding 8)', logs.length > 0 && !/READTOKEN|WRITETOKEN|token=|https?:\/\//.test(logs) && logs.includes('media-incoming/0xabc/5f1e'), logs.slice(0, 200));
