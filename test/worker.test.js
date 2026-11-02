@@ -410,24 +410,69 @@ async function endpoints() {
       check(`a leading tag, then 300 zero bytes, ${who}: 200, the tag and the zeros gone, clean frame to frame, audio packets identical`,
         cp.r.statusCode === 200 && !cp.uploaded.includes(Buffer.from('Fixtureville')) && (await media.metadataReport(cpOut, 'mp3')).clean && (await packetHash(plain)) === (await packetHash(cpOut)), `${cp.r.statusCode} ${cp.r.body.slice(0, 120)}`);
       if (cpOut) await rm(cpOut, { force: true });
-      // Astra's P2-2 (2026-11-01): nothing is trimmed. A cut-off last frame is refused (a re-export), and so is a
-      // trailer read back from the end that overlaps a frame: a cut frame with a real ID3v1 after it, which can't be
-      // told from a tag inside the last frame
+      // a cut-off LAST frame is dropped (Sandy, 2026-11-01, reversing Astra's P2-2: archive files often have no source
+      // left to re-export), when nothing but trailers read back from the end follows it; and a trailer that runs into
+      // the last frame takes that frame with it. Both cut, nothing of them kept. Each shape: 200, the strict walk
+      // clean, the audio packets equal to the input's frames without its last one, none of the cut bytes or tag text
+      // in the output
       const packets = (await sh('ffprobe', ['-v', 'error', '-select_streams', 'a', '-show_entries', 'packet=pos,size', '-of', 'csv=p=0', plain])).trim().split('\n')
         .map((l) => { const [size, pos] = l.split(',').filter(Boolean).map(Number); return { pos, size }; }); // ffprobe prints size, then pos
       const lastFrame = packets[packets.length - 1];
       const v1 = (text) => { const b = Buffer.alloc(128); b.write('TAG', 0, 'latin1'); b.write(text, 3, 'latin1'); b[127] = 255; return b; };
-      for (const [label, bytes, code, where] of [
-        ['a cut-off last frame (100 bytes short)', pb.subarray(0, pb.length - 100), 'mp3-truncated', lastFrame.pos],
-        ['a cut-off last frame with an ID3v1 tag after it', Buffer.concat([pb.subarray(0, pb.length - 100), v1(SECRET)]), 'mp3-tag-in-audio', pb.length - 100],
+      const apeItem = (text) => { const item = Buffer.concat([Buffer.alloc(8), Buffer.from(`Title\0${text}`, 'latin1')]); item.writeUInt32LE(text.length, 0); return item; };
+      const apeBlock = (size, flags) => { const f = Buffer.alloc(32); f.write('APETAGEX', 0, 'latin1'); f.writeUInt32LE(2000, 8); f.writeUInt32LE(size, 12); f.writeUInt32LE(1, 16); f.writeUInt32LE(flags >>> 0, 20); return f; };
+      const ape = (text) => { const item = apeItem(text); return Buffer.concat([item, apeBlock(item.length + 32, 0)]); };
+      const apeWithHeader = (text) => { const item = apeItem(text); return Buffer.concat([apeBlock(item.length + 32, 0xa0000000), item, apeBlock(item.length + 32, 0x80000000)]); };
+      const lyrics2 = (text) => { const body = Buffer.from(`LYRICSBEGINLYR${String(text.length).padStart(5, '0')}${text}`, 'latin1'); return Buffer.concat([body, Buffer.from(`${String(body.length).padStart(6, '0')}LYRICS200`, 'latin1')]); };
+      const kept = path.join(tmp, `kept-${who}.mp3`);
+      await writeFile(kept, pb.subarray(0, lastFrame.pos)); // the input's frames without the last one
+      const keptHash = await packetHash(kept);
+      const cut100 = pb.subarray(0, pb.length - 100);
+      for (const [label, bytes, remains] of [
+        ['the last frame 100 bytes short', cut100],
+        ['the last frame 1 byte short', pb.subarray(0, pb.length - 1)],
+        ['the last frame its 4-byte header only', pb.subarray(0, lastFrame.pos + 4)],
+        ['the last frame 2 bytes of its header only', pb.subarray(0, lastFrame.pos + 2)],
+        ['the last frame 2 bytes of its header, then an ID3v1', Buffer.concat([pb.subarray(0, lastFrame.pos + 2), v1(SECRET)])],
+        ['the last frame its header, then zeros (as old rips end)', Buffer.concat([pb.subarray(0, lastFrame.pos + 4), Buffer.alloc(lastFrame.size - 130)])],
+        ['the last frame cut, its remains carrying text', Buffer.concat([pb.subarray(0, lastFrame.pos + 36), Buffer.from(SECRET, 'latin1')])],
+        ['the last frame cut, an ID3v1 after it', Buffer.concat([cut100, v1(SECRET)])],
+        ['the last frame cut, an APE tag (items and footer) after it', Buffer.concat([cut100, ape(SECRET)])],
+        ['the last frame cut, an APE tag with its header, then an ID3v1', Buffer.concat([cut100, apeWithHeader(SECRET), v1(SECRET)])],
+        ['the last frame cut, an ID3 v2.4 tag with its footer after it', Buffer.concat([cut100, id3['v2.4 with a footer'](SECRET)])],
+        ['the last frame cut, Lyrics3 v2 then an ID3v1', Buffer.concat([cut100, lyrics2(SECRET), v1(SECRET)])],
+        ['the last frame cut, Lyrics3 v1 then an ID3v1', Buffer.concat([cut100, lyrics1, v1(SECRET)])],
+      ].map(([l, b]) => [l, b, b.subarray(lastFrame.pos, Math.min(b.length, lastFrame.pos + lastFrame.size))])) {
+        const c = await call('/strip-metadata', bytes);
+        const out = c.uploaded && await writeTmp(c.uploaded, '.mp3');
+        check(`${label}, ${who}: 200, the cut frame and the trailers dropped (clean frame to frame, audio packets equal to the input's frames without its last, none of its ${remains.length} cut bytes, no tag text)`,
+          c.r.statusCode === 200 && exact(c.json) && (await media.metadataReport(out, 'mp3')).clean && (await packetHash(out)) === keptHash
+            && (remains.length < 16 || !c.uploaded.includes(remains)) && !c.uploaded.includes(Buffer.from('Fixtureville')),
+          `${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
+        if (out) await rm(out, { force: true });
+      }
+      for (const [label, bytes] of [['the last frame cut, an ID3v1 after it', Buffer.concat([cut100, v1(SECRET)])], ['the last frame its header only', pb.subarray(0, lastFrame.pos + 4)]]) {
+        const e = await call('/enhance', bytes, { body: { enhancementType: 'clean' } });
+        check(`...through /enhance, ${label}, ${who}: 200, a WAV with no tag text`, e.r.statusCode === 200 && exact(e.json) && e.uploaded.subarray(0, 4).toString('latin1') === 'RIFF' && !e.uploaded.includes(Buffer.from('Fixtureville')), `${e.r.statusCode} ${e.r.body.slice(0, 120)}`);
+      }
+      // ...and only the LAST frame: a cut frame mid-file, or junk after a cut last frame that runs past where that
+      // frame would end (not a trailer), leaves the walk on bytes it can't account for: refused. (Junk that ends
+      // inside the cut frame's length can't be told from that frame's own bytes: it is dropped with them.)
+      const mid = packets[Math.floor(packets.length / 2)];
+      const junk3 = Buffer.concat([junk, junk, junk]);
+      for (const [label, bytes, where] of [
+        ['a middle frame 100 bytes short', Buffer.concat([pb.subarray(0, mid.pos + mid.size - 100), pb.subarray(mid.pos + mid.size)]), mid.pos + mid.size],
+        [`the last frame cut, then ${junk3.length} bytes of text`, Buffer.concat([cut100, junk3]), pb.length],
+        [`the last frame cut, then ${junk3.length} bytes of text, then an ID3v1`, Buffer.concat([cut100, junk3, v1(SECRET)]), pb.length],
+        ['every frame whole, then 3 bytes that don\'t start a header of this stream', Buffer.concat([pb, Buffer.from([0xff, pb[lastFrame.pos + 1] ^ 0x08, 0x90])]), pb.length],
       ]) {
         const dirsBefore = (await jobDirs()).length;
         const c = await call('/strip-metadata', bytes);
-        check(`${label}, ${who} → REFUSED 415 {error: ${code}, detail: {at: ${where}}}, nothing written, no temp dir left`,
-          c.r.statusCode === 415 && JSON.stringify(c.json) === JSON.stringify({ error: code, detail: { at: where } }) && c.uploaded === null && (await jobDirs()).length === dirsBefore,
+        check(`${label}, ${who} → still REFUSED 415 {error: mp3-structure, detail: {at: ${where}}}, nothing written, no temp dir left`,
+          c.r.statusCode === 415 && JSON.stringify(c.json) === JSON.stringify({ error: 'mp3-structure', detail: { at: where } }) && c.uploaded === null && (await jobDirs()).length === dirsBefore,
           `${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
-        const e = await enhanceRefuses(bytes, { error: code, detail: { at: where } });
-        check(`...the same through /enhance: 415 ${code} {at: ${where}}, nothing written`, e === '', e);
+        const e = await enhanceRefuses(bytes, { error: 'mp3-structure', detail: { at: where } });
+        check(`...the same through /enhance: 415 mp3-structure {at: ${where}}, nothing written`, e === '', e);
       }
       const tagged1 = await call('/strip-metadata', Buffer.concat([pb, v1(SECRET)]));
       check(`positive control: the whole last frame, then an ID3v1 tag, ${who}: 200, the tag gone`, tagged1.r.statusCode === 200 && exact(tagged1.json) && !tagged1.uploaded.includes(Buffer.from('Fixtureville')), `${tagged1.r.statusCode} ${tagged1.r.body.slice(0, 120)}`);
@@ -475,11 +520,13 @@ async function endpoints() {
         check(`...and it is the decode that refuses it: the frame walk alone accepts that file (${walked})`, walked === 'accepted');
       }
       // Astra's P1 (2026-11-01): a tag INSIDE a frame, written over the end of its interior (the frame's length
-      // unchanged), in the last frame and a middle one, each kind. Compressed audio is never cut: the file is refused
-      // (415 mp3-tag-in-audio, where the tag is seen), nothing written. And the output walk catches each one on its own:
-      // given the bytes directly, and through the endpoint with the input rebuild sabotaged into a plain copy.
-      const apeItem = (text) => { const item = Buffer.concat([Buffer.alloc(8), Buffer.from(`Title\0${text}`, 'latin1')]); item.writeUInt32LE(text.length, 0); return item; };
-      const ape = (text) => { const item = apeItem(text); const f = Buffer.alloc(32); f.write('APETAGEX', 0, 'latin1'); f.writeUInt32LE(2000, 8); f.writeUInt32LE(item.length + 32, 12); f.writeUInt32LE(1, 16); return Buffer.concat([item, f]); };
+      // unchanged), in the last frame and a middle one, each kind. Compressed audio is never cut: inside a WHOLE frame
+      // the file is refused (415 mp3-tag-in-audio, where the tag is seen), nothing written. In the last frame, the
+      // kinds read back from the end as a trailer (ID3v1, APE by its footer, ID3 v2.4 by its footer) end the audio
+      // inside that frame: it is the cut last frame, dropped with the tag (Sandy, 2026-11-01), so 200 and none of
+      // the tag text kept; ID3 v2.2 and v2.3 there have no footer, the frame stays whole, and they are refused. And
+      // the output walk catches each one on its own: given the bytes directly, and through the endpoint with the
+      // input rebuild sabotaged into a plain copy.
       const kinds = [...Object.entries(id3).map(([v, make]) => [`ID3 ${v}`, make, 'id3v2']), ['ID3v1', v1, 'id3v1'], ['APE (an item and its footer)', ape, 'ape']];
       for (const [place, frame] of [['the last frame', lastFrame], ['a middle frame', packets[Math.floor(packets.length / 2)]]]) {
         for (const [kind, make, named] of kinds) {
@@ -490,13 +537,24 @@ async function endpoints() {
           // where it's seen: where the tag starts; an APE tag inside a middle frame by its footer (at the end of the
           // file, a trailer is read back from the end: from its first item)
           const where = start + (named === 'ape' && place === 'a middle frame' ? apeItem(SECRET).length : 0);
-          const dirsBefore = (await jobDirs()).length;
-          const c = await call('/strip-metadata', bytes);
-          check(`${kind} inside ${place}, ${who} → REFUSED 415 {error: mp3-tag-in-audio, detail: {at: ${where}}}, nothing written, no temp dir left`,
-            c.r.statusCode === 415 && JSON.stringify(c.json) === JSON.stringify({ error: 'mp3-tag-in-audio', detail: { at: where } }) && c.uploaded === null && (await jobDirs()).length === dirsBefore,
-            `${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
-          const e = await enhanceRefuses(bytes, { error: 'mp3-tag-in-audio', detail: { at: where } });
-          check(`...the same through /enhance: 415 mp3-tag-in-audio {at: ${where}}, nothing written`, e === '', e);
+          if (place === 'the last frame' && (named !== 'id3v2' || kind.includes('footer'))) {
+            for (const ep of ['/strip-metadata', '/enhance']) {
+              const c = await call(ep, bytes, ep === '/enhance' ? { body: { enhancementType: 'clean' } } : {});
+              const out = ep === '/strip-metadata' && c.uploaded && await writeTmp(c.uploaded, '.mp3');
+              check(`${kind} inside ${place}, ${who}, ${ep}: read back as a trailer, the last frame dropped with it: 200, no tag text${out ? ', clean frame to frame, audio packets equal to the input\'s frames without its last' : ''}`,
+                c.r.statusCode === 200 && exact(c.json) && !c.uploaded.includes(Buffer.from('Fixtureville')) && (!out || ((await media.metadataReport(out, 'mp3')).clean && (await packetHash(out)) === keptHash)),
+                `${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
+              if (out) await rm(out, { force: true });
+            }
+          } else {
+            const dirsBefore = (await jobDirs()).length;
+            const c = await call('/strip-metadata', bytes);
+            check(`${kind} inside ${place}, ${who} → REFUSED 415 {error: mp3-tag-in-audio, detail: {at: ${where}}}, nothing written, no temp dir left`,
+              c.r.statusCode === 415 && JSON.stringify(c.json) === JSON.stringify({ error: 'mp3-tag-in-audio', detail: { at: where } }) && c.uploaded === null && (await jobDirs()).length === dirsBefore,
+              `${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
+            const e = await enhanceRefuses(bytes, { error: 'mp3-tag-in-audio', detail: { at: where } });
+            check(`...the same through /enhance: 415 mp3-tag-in-audio {at: ${where}}, nothing written`, e === '', e);
+          }
           const f = await writeTmp(bytes, '.mp3');
           const walked = await mp3Frames.mp3Leftovers(f);
           await rm(f, { force: true });
