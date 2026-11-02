@@ -431,6 +431,26 @@ async function endpoints() {
       }
       const tagged1 = await call('/strip-metadata', Buffer.concat([pb, v1(SECRET)]));
       check(`positive control: the whole last frame, then an ID3v1 tag, ${who}: 200, the tag gone`, tagged1.r.statusCode === 200 && exact(tagged1.json) && !tagged1.uploaded.includes(Buffer.from('Fixtureville')), `${tagged1.r.statusCode} ${tagged1.r.body.slice(0, 120)}`);
+      // Lyrics3 v1 (the Reviewer, 2026-11-01: a real file had one): it has no size, so it's removed only where it
+      // belongs, its LYRICSEND directly before an ID3v1 at the end. Anywhere else it stays refused (above: after the
+      // audio with no ID3v1 after it)
+      for (const ep of ['/strip-metadata', '/enhance']) {
+        const c = await call(ep, Buffer.concat([pb, lyrics1, v1(SECRET)]), ep === '/enhance' ? { body: { enhancementType: 'clean' } } : {});
+        const out = ep === '/strip-metadata' && c.uploaded && await writeTmp(c.uploaded, '.mp3');
+        check(`Lyrics3 v1 then ID3v1 after the audio, ${who}, ${ep}: 200, both gone (no LYRICS marker, no tag text)${out ? ', clean frame to frame, audio packets identical' : ''}`,
+          c.r.statusCode === 200 && exact(c.json) && !c.uploaded.includes(Buffer.from('Fixtureville')) && !c.uploaded.includes(Buffer.from('LYRICS', 'latin1'))
+            && (!out || ((await media.metadataReport(out, 'mp3')).clean && (await packetHash(plain)) === (await packetHash(out)))),
+          `${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
+        if (out) await rm(out, { force: true });
+      }
+      for (const [label, bytes, where] of [
+        ['Lyrics3 v1, one byte, then ID3v1 (its LYRICSEND not directly before the TAG)', Buffer.concat([pb, lyrics1, Buffer.from('x'), v1(SECRET)]), pb.length],
+        ['Lyrics3 v1 between frames, an ID3v1 at the end', Buffer.concat([pb.subarray(0, at), lyrics1, pb.subarray(at), v1(SECRET)]), at],
+      ]) {
+        const c = await call('/strip-metadata', bytes);
+        check(`${label}, ${who} → still REFUSED 415 {error: mp3-structure, detail: {at: ${where}}}, nothing written`,
+          c.r.statusCode === 415 && JSON.stringify(c.json) === JSON.stringify({ error: 'mp3-structure', detail: { at: where } }) && c.uploaded === null, `${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
+      }
       // ...and through /enhance: tags at the start, between frames and at the end are removed, not refused
       const enhTagged = await call('/enhance', Buffer.concat([id3['v2.3'](SECRET), pb.subarray(0, at), id3['v2.2'](SECRET), pb.subarray(at), v1(SECRET)]), { body: { enhancementType: 'clean' } });
       check(`positive control through /enhance, ${who}: ID3v2 at the start and between frames plus an ID3v1 at the end → 200, a WAV with none of their text`,
