@@ -553,9 +553,11 @@ async function endpoints() {
         JSON.stringify(got) === JSON.stringify(['[]', '["mp3-unparsed"]', '["mp3-short-frame"]', '["id3v2"]', '["mp3-unparsed"]']), JSON.stringify(got));
     }
     // near misses from real audio (Sandy's 94-minute set, 2026-11-01, refused at byte 45,522,714 by this check's
-    // first version): quiet frames are mostly zero bytes, so a chance "TAG" or "ID3" there reads as a well-formed EMPTY
-    // tag. Each written over a middle frame's end: accepted by the input rebuild and clean to the output walk. Then the
-    // same shapes carrying text: refused.
+    // first version): quiet frames are mostly zero bytes, so a chance "ID3" there reads as a well-formed EMPTY tag.
+    // Each written over a middle frame's end: accepted by the input rebuild and clean to the output walk. Then the
+    // shapes that count: refused. An ID3v1 counts by rule A (Sandy, 2026-11-01): every text field printable ASCII or
+    // Latin-1, or NUL, at any length and empty included; so a "TAG" counts unless a byte in its text fields is a
+    // control character
     {
       const plainM = path.join(tmp, 'placed-mono.mp3');
       const pm = await readFile(plainM);
@@ -572,25 +574,33 @@ async function endpoints() {
         return got;
       };
       const misses = [
-        ['Sandy\'s set\'s own bytes: TAG ßG}2oô, then zeros', pad(Buffer.from('544147df477d326ff4', 'hex'))],
-        ['TAG, a title of 6 letters and digits ("Track 1"), zeros', pad(Buffer.from('TAGTrack 1', 'latin1'))],
+        ['TAG, a title with a control byte (0x01) in it, zeros', pad(Buffer.from('TAGTrack\x011', 'latin1'))],
+        ['TAG, an album with a C1 byte (0x85) in it, zeros', pad(Buffer.concat([Buffer.from('TAG', 'latin1'), Buffer.alloc(60), Buffer.from([0x41, 0x85])]))],
+        ['TAG, a comment with DEL (0x7f) in it, zeros', pad(Buffer.concat([Buffer.from('TAG', 'latin1'), Buffer.alloc(94), Buffer.from([0x7f])]))],
         ['ID3 v2.3 of size 0, then zeros', pad(Buffer.from('ID3\x03\x00\x00\x00\x00\x00\x00', 'latin1'))],
         ['ID3 v2.4 whose body is zeros (padding only)', pad(Buffer.concat([Buffer.from('ID3\x04\x00\x00', 'latin1'), Buffer.from([0, 0, 0, 60])]))],
       ];
       const got = [];
       for (const [, t] of misses) got.push(await twice(over(t)));
       check(`near misses, ${misses.length} (${misses.map(([l]) => l).join('; ')}): each accepted by the input rebuild and clean to the output walk`, got.every((g) => g === '[]'), JSON.stringify(got));
-      const nick = await call('/strip-metadata', over(misses[0][1]));
-      check('...and Sandy\'s set\'s bytes through the endpoint: 200', nick.r.statusCode === 200 && exact(nick.json), `${nick.r.statusCode} ${nick.r.body.slice(0, 120)}`);
-      const carrying = [
+      const counting = [
+        ['Sandy\'s set\'s own bytes: TAG ßG}2oô, then zeros (rule A refuses that file)', pad(Buffer.from('544147df477d326ff4', 'hex')), 'id3v1'],
+        ['TAG with a five-character title ("Lagos")', pad(Buffer.from('TAGLagos', 'latin1')), 'id3v1'],
+        ['TAG with a non-ASCII Latin-1 title ("Café Ñandú")', pad(Buffer.from('TAGCafé Ñandú', 'latin1')), 'id3v1'],
+        ['TAG with every text field empty (her refinement, measured and not kept)', pad(Buffer.from('TAG', 'latin1')), 'id3v1'],
+        ['TAG with a shortened title (its text, a NUL, the old text\'s tail)', pad(Buffer.from('TAGLagos\x00Fixtureville', 'latin1')), 'id3v1'],
         ['TAG with a title of 8 letters and digits ("Track 123")', pad(Buffer.from('TAGTrack 123', 'latin1')), 'id3v1'],
         ['ID3 v2.3 with a TIT2 frame', id3['v2.3']('x'), 'id3v2'],
       ];
-      for (const [label, t, named] of carrying) {
+      for (const [label, t, named] of counting) {
         const where = mid.pos + mid.size - t.length;
-        check(`...carrying text: ${label} → refused at ${where} (mp3-tag-in-audio), the output walk names it (${named})`,
+        check(`...counting: ${label} → refused at ${where} (mp3-tag-in-audio), the output walk names it (${named})`,
           (await twice(over(t))) === `mp3-tag-in-audio {"at":${where}}` && JSON.stringify(await (async () => { const f = await writeTmp(over(t), '.mp3'); const r = await mp3Frames.mp3Leftovers(f); await rm(f, { force: true }); return r; })()) === JSON.stringify([named]));
       }
+      const nick = await call('/strip-metadata', over(counting[0][1]));
+      const where = mid.pos + mid.size - 128;
+      check(`...and Sandy's set's bytes through the endpoint: 415 {error: mp3-tag-in-audio, detail: {at: ${where}}}, nothing written`,
+        nick.r.statusCode === 415 && JSON.stringify(nick.json) === JSON.stringify({ error: 'mp3-tag-in-audio', detail: { at: where } }) && nick.uploaded === null, `${nick.r.statusCode} ${nick.r.body.slice(0, 120)}`);
     }
     // false refusals (the Reviewer, 2026-11-01): compressed audio is close to random bytes, so "TAG" and "ID3" turn up
     // inside real frames by chance (about once per 16 MB each). A corpus of clean encodes, noise and tone, mono and
