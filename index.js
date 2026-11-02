@@ -19,7 +19,35 @@ const { loggerOptions, routeOf } = require('./lib/logging');
 // Use system FFmpeg (installed via apt in Dockerfile)
 
 // Its own lines and Fastify's go through ./lib/logging: no URL, no message text
-const app = Fastify({ logger: loggerOptions() });
+const app = Fastify({
+  logger: loggerOptions(),
+  // a malformed URL (Fastify's default reply quotes the path) or a failed async constraint: a code (Astra's P2 on #4)
+  frameworkErrors: (error, request, reply) => refuse(error, request, reply),
+  clientErrorHandler,
+});
+
+// Fastify's own errors (a body that isn't JSON, one too large, an unknown content
+// type, a hook that throws, a URL it can't decode…) leave as a code too: its
+// default handler replies with the error's message and logs it, and a JSON parse
+// error's message quotes the body (the Reviewer's P3 on #4, Astra's P2-3). A 4xx
+// is bad-request, anything else internal; logged as route, code and status.
+function refuse(error, request, reply) {
+  const { status, body } = failure(error, (e) => (e.statusCode >= 400 && e.statusCode < 500 ? 'bad-request' : null));
+  const line = { route: routeOf(request.url), status, ...body };
+  if (status < 500) app.log.info(line, 'Request refused');
+  else app.log.error(line, 'Request failed');
+  reply.status(status).send(body);
+}
+// ...and the HTTP parser's, before there is a request at all (a malformed request
+// line or header, headers too large, a timeout): Fastify's default reply is fixed
+// text, but it isn't one of the worker's codes, and it logs the error itself
+const CLIENT_ERROR = JSON.stringify({ error: 'bad-request' });
+function clientErrorHandler(err, socket) {
+  if (err.code === 'ECONNRESET' || socket.destroyed) return;
+  app.log.info({ route: 'unmatched', status: 400, error: 'bad-request' }, 'Request refused');
+  if (socket.writable) socket.end(`HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: ${CLIENT_ERROR.length}\r\nConnection: close\r\n\r\n${CLIENT_ERROR}`);
+  else socket.destroy();
+}
 
 // Enable CORS for mixmi frontend
 app.register(cors, {
@@ -45,18 +73,7 @@ app.addHook('onRequest', async (request, reply) => {
   if (!guards.secretOk(request.headers[SECRET_HEADER], secret)) return reply.status(401).send({ error: 'unauthorized' });
 });
 
-// Fastify's own errors (a body that isn't JSON, one too large, an unknown content
-// type, a hook that throws…) leave as a code too: its default handler replies with
-// the error's message and logs it, and a JSON parse error's message quotes the body
-// (the Reviewer's P3 on #4, Astra's P2-3). A 4xx is bad-request, anything else
-// internal; logged as route, code and status.
-app.setErrorHandler((error, request, reply) => {
-  const { status, body } = failure(error, (e) => (e.statusCode >= 400 && e.statusCode < 500 ? 'bad-request' : null));
-  const line = { route: routeOf(request.url), status, ...body };
-  if (status < 500) app.log.info(line, 'Request refused');
-  else app.log.error(line, 'Request failed');
-  reply.status(status).send(body);
-});
+app.setErrorHandler(refuse);
 // ...and a route the worker doesn't have: Fastify's default 404 echoes the method
 // and URL in its reply and its log
 app.setNotFoundHandler((request, reply) => {
@@ -140,6 +157,12 @@ function runFfmpeg(args, { fsizeBytes, cwd, timeoutMs = FFMPEG_TIMEOUT_MS }) {
  * `work` turns it into an output file that has passed its own verification,
  * and the output is written back in place (deadline). Temp files: one temp dir,
  * removed in finally. Logs: jobId + bucket/key only.
+ *
+ * Before any `work` reads it, an MP3 is rebuilt from its audio frames alone
+ * (lib/mp3Frames): every tag, wherever it sits, dropped; a tag inside the
+ * frames, a cut-off frame or any byte that is neither a frame nor a tag refuses
+ * the file. Every endpoint reads the rebuilt file (Astra's P2 on #4: /enhance
+ * decoded the original).
  */
 function inPlaceEndpoint(name, work, validate = () => null) {
   return async (request, reply) => {
@@ -161,10 +184,16 @@ function inPlaceEndpoint(name, work, validate = () => null) {
         // the closed input rule (lib/inputs): an allowlisted container by its
         // magic bytes, or refused before ffmpeg ever runs (playlists, concat
         // lists, SDP and every other indirection format included)
-        if (!inputs.containerOfFile(input)) throw new inputs.InputRefused('Not an accepted media container');
-        const out = await work({ jobId, ref, dir, input, contentType: got.contentType, body: request.body || {} });
+        const container = inputs.containerOfFile(input);
+        if (!container) throw new inputs.InputRefused('Not an accepted media container');
+        let src = input, mp3 = null;
+        if (container === 'mp3') {
+          src = path.join(dir, 'in-frames');
+          mp3 = await media.sanitizeMp3(input, src);
+        }
+        const out = await work({ jobId, ref, dir, input: src, contentType: got.contentType, body: request.body || {} });
         const up = await io.uploadFile(uploadUrl, out.file, out.contentType, { deadlineMs: UPLOAD_DEADLINE_MS });
-        app.log.info({ jobId, ref, endpoint: name, bytes: up.bytes, ...out.log }, 'Written back in place');
+        app.log.info({ jobId, ref, endpoint: name, bytes: up.bytes, ...out.log, ...(mp3 && { mp3Frames: mp3.frames, mp3Removed: mp3.removed }) }, 'Written back in place');
       });
       // The ONE success shape, for every endpoint: exactly these three fields.
       // Every endpoint writes a verified metadata-free file, so stripped is
@@ -323,21 +352,15 @@ app.post('/strip-metadata', inPlaceEndpoint('strip', async ({ dir, input, conten
     const r = await sei.seiReport(input, codec, dir, PROBE_DEADLINE_MS * 2);
     if (r.private) throw unsupported('private-sei-refused');
   }
-  // MP3: rebuilt from its audio frames alone (lib/mp3Frames): every tag, wherever it sits, dropped; any byte that
-  // is neither a frame nor a tag refuses the file. Everything after this reads the rebuilt file.
-  let src = input, mp3 = null;
-  if (fmt.family === 'mp3') {
-    src = path.join(dir, 'in-frames');
-    mp3 = await media.sanitizeMp3(input, src);
-  }
+  // (an MP3 arrives here already rebuilt from its frames: inPlaceEndpoint)
   // TRUE length by counting; then the remux is limited to exactly the packets
   // counted in the input (per stream) and bytes just over the input's
-  const caps = stripCaps(await io.fileSize(src));
-  await measureOrRefuse(src, { audioStreams: fmt.audio, capSec: caps.maxDurationSec, what: 'Input', cwd: dir });
+  const caps = stripCaps(await io.fileSize(input));
+  await measureOrRefuse(input, { audioStreams: fmt.audio, capSec: caps.maxDurationSec, what: 'Input', cwd: dir });
   const STRIP_MAPS = ['-map', '0:V?', '-map', '0:a?'];
-  const inPackets = (await counted(() => limits.packetCounts(src, STRIP_MAPS, Infinity, FFMPEG_TIMEOUT_MS, dir))).counts;
+  const inPackets = (await counted(() => limits.packetCounts(input, STRIP_MAPS, Infinity, FFMPEG_TIMEOUT_MS, dir))).counts;
   const output = path.join(dir, `out.${fmt.muxer}`);
-  await media.stripMedia(src, output, fmt, FFMPEG_TIMEOUT_MS, { frames: inPackets, maxBytes: caps.maxOutputBytes });
+  await media.stripMedia(input, output, fmt, FFMPEG_TIMEOUT_MS, { frames: inPackets, maxBytes: caps.maxOutputBytes });
   await refuseIfCut(output, caps.maxOutputBytes, 'Stripped');
   const outPackets = (await counted(() => limits.packetCounts(output, STRIP_MAPS, Infinity, FFMPEG_TIMEOUT_MS, dir))).counts;
   if (JSON.stringify(outPackets) !== JSON.stringify(inPackets)) throw unverified('packets-mismatch');
@@ -346,12 +369,12 @@ app.post('/strip-metadata', inPlaceEndpoint('strip', async ({ dir, input, conten
   await verifyClean(output, fmt.family);
   if (avc) await verifySei(output, codec, dir);
   // Same real picture and sound streams, same duration — before anything is written back
-  const [inSum, outSum] = await Promise.all([media.streamSummary(src, PROBE_DEADLINE_MS), media.streamSummary(output, PROBE_DEADLINE_MS)]);
+  const [inSum, outSum] = await Promise.all([media.streamSummary(input, PROBE_DEADLINE_MS), media.streamSummary(output, PROBE_DEADLINE_MS)]);
   if (!media.sameContent(inSum, outSum)) {
     throw unverified('content-mismatch', { inVideo: inSum.video, inAudio: inSum.audio, outVideo: outSum.video, outAudio: outSum.audio });
   }
   const type = /^(video|audio)\//.test(contentType || '') ? contentType : 'application/octet-stream';
-  return { file: output, contentType: type, log: { family: fmt.family, ...(mp3 && { mp3Frames: mp3.frames, mp3Removed: mp3.removed }) } };
+  return { file: output, contentType: type, log: { family: fmt.family } };
 }));
 
 // Start server (only when run directly — tests require the app and use inject)

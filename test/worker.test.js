@@ -21,6 +21,7 @@ const FIX = (f) => path.join(__dirname, 'fixtures', f);
 const sh = (cmd, args) => new Promise((res, rej) => execFile(cmd, cmd === 'ffmpeg' ? ['-nostdin', '-y', ...args] : args, { timeout: 120_000 }, (e, so, se) => (e ? rej(new Error(se || e.message)) : res(so))));
 const crypto = require('crypto');
 const sei = require('../lib/videoSei');
+const limits = require('../lib/limits');
 /** The HDR10+ T.35 payload x265 wrote into test/fixtures/hdr.mp4 (ffmpeg reads it as SMPTE 2094-40). */
 async function hdr10PlusFromFixture() {
   const es = path.join(os.tmpdir(), `hdr-${process.pid}.hevc`);
@@ -381,6 +382,14 @@ async function endpoints() {
           if (out) await rm(out, { force: true });
         }
       }
+      // Astra's P2 on #4 (2026-11-01): /enhance decoded the original input, so a tagged or cut file got 200 there. The
+      // MP3 rebuild now runs at the input boundary, before every endpoint's work: each refusal below is checked
+      // through /enhance too, with the same code and the same `at`
+      const enhanceRefuses = async (bytes, body) => {
+        const dirsBefore = (await jobDirs()).length;
+        const e = await call('/enhance', bytes, { body: { enhancementType: 'clean' } });
+        return e.r.statusCode === 415 && JSON.stringify(e.json) === JSON.stringify(body) && e.uploaded === null && (await jobDirs()).length === dirsBefore ? '' : `${e.r.statusCode} ${e.r.body.slice(0, 120)}`;
+      };
       // bytes that are neither a frame nor a tag: REFUSED (415 mp3-structure, with where), nothing written, no temp dir left
       const junk = Buffer.from(`${SECRET} private notes, not a tag`, 'latin1');
       const huge = Buffer.concat([Buffer.from('ID3\x03\x00\x00', 'latin1'), syncsafe4(50 * 1024 * 1024), Buffer.from(SECRET, 'latin1')]); // a tag whose size runs past the end
@@ -391,6 +400,8 @@ async function endpoints() {
         check(`${label}, ${who} → REFUSED 415 {error: mp3-structure, detail: {at: ${where}}}, nothing written, no temp dir left`,
           c.r.statusCode === 415 && JSON.stringify(c.json) === JSON.stringify({ error: 'mp3-structure', detail: { at: where } }) && c.uploaded === null && (await jobDirs()).length === dirsBefore,
           `${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
+        const e = await enhanceRefuses(bytes, { error: 'mp3-structure', detail: { at: where } });
+        check(`...the same through /enhance: 415 mp3-structure {at: ${where}}, nothing written`, e === '', e);
       }
       // what it drops without refusing: zero padding after a leading tag (not audio)
       const padded = Buffer.concat([id3['v2.3'](SECRET), Buffer.alloc(300), pb]);
@@ -415,9 +426,34 @@ async function endpoints() {
         check(`${label}, ${who} → REFUSED 415 {error: ${code}, detail: {at: ${where}}}, nothing written, no temp dir left`,
           c.r.statusCode === 415 && JSON.stringify(c.json) === JSON.stringify({ error: code, detail: { at: where } }) && c.uploaded === null && (await jobDirs()).length === dirsBefore,
           `${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
+        const e = await enhanceRefuses(bytes, { error: code, detail: { at: where } });
+        check(`...the same through /enhance: 415 ${code} {at: ${where}}, nothing written`, e === '', e);
       }
       const tagged1 = await call('/strip-metadata', Buffer.concat([pb, v1(SECRET)]));
       check(`positive control: the whole last frame, then an ID3v1 tag, ${who}: 200, the tag gone`, tagged1.r.statusCode === 200 && exact(tagged1.json) && !tagged1.uploaded.includes(Buffer.from('Fixtureville')), `${tagged1.r.statusCode} ${tagged1.r.body.slice(0, 120)}`);
+      // ...and through /enhance: tags at the start, between frames and at the end are removed, not refused
+      const enhTagged = await call('/enhance', Buffer.concat([id3['v2.3'](SECRET), pb.subarray(0, at), id3['v2.2'](SECRET), pb.subarray(at), v1(SECRET)]), { body: { enhancementType: 'clean' } });
+      check(`positive control through /enhance, ${who}: ID3v2 at the start and between frames plus an ID3v1 at the end → 200, a WAV with none of their text`,
+        enhTagged.r.statusCode === 200 && exact(enhTagged.json) && enhTagged.uploaded.subarray(0, 4).toString('latin1') === 'RIFF' && !enhTagged.uploaded.includes(Buffer.from('Fixtureville')), `${enhTagged.r.statusCode} ${enhTagged.r.body.slice(0, 120)}`);
+      // Astra's P2 on #4 (2026-11-01): a corrupt middle frame, its header intact (so the frame walk accepts it), passed:
+      // ffmpeg skips it, logs an error and exits 0. The full decode now refuses on any error-level line, as a code only
+      {
+        const mid = packets[Math.floor(packets.length / 2)];
+        const bad = Buffer.from(pb);
+        bad.fill(0xff, mid.pos + 4, mid.pos + mid.size); // the header kept, the side info and audio data garbage
+        for (const ep of ['/strip-metadata', '/enhance']) {
+          const dirsBefore = (await jobDirs()).length;
+          const c = await call(ep, bad, ep === '/enhance' ? { body: { enhancementType: 'clean' } } : {});
+          check(`a corrupt middle frame (header intact), ${who}, ${ep} → REFUSED 415 {error: audio-decode-error} exactly, nothing written, no decoder text in the reply or the log`,
+            c.r.statusCode === 415 && c.r.body === '{"error":"audio-decode-error"}' && c.uploaded === null && (await jobDirs()).length === dirsBefore && !/mp3float|big_values|Error while|Invalid data/i.test(c.logs),
+            `${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
+        }
+        const f = await writeTmp(bad, '.mp3');
+        let walked = null;
+        try { await mp3Frames.sanitizeMp3(f, `${f}.frames`); walked = 'accepted'; } catch (e) { walked = e.workerCode; }
+        await rm(f, { force: true }); await rm(`${f}.frames`, { force: true });
+        check(`...and it is the decode that refuses it: the frame walk alone accepts that file (${walked})`, walked === 'accepted');
+      }
       // Astra's P1 (2026-11-01): a tag INSIDE a frame, written over the end of its interior (the frame's length
       // unchanged), in the last frame and a middle one, each kind. Compressed audio is never cut: the file is refused
       // (415 mp3-tag-in-audio, where the tag is seen), nothing written. And the output walk catches each one on its own:
@@ -439,6 +475,8 @@ async function endpoints() {
           check(`${kind} inside ${place}, ${who} → REFUSED 415 {error: mp3-tag-in-audio, detail: {at: ${where}}}, nothing written, no temp dir left`,
             c.r.statusCode === 415 && JSON.stringify(c.json) === JSON.stringify({ error: 'mp3-tag-in-audio', detail: { at: where } }) && c.uploaded === null && (await jobDirs()).length === dirsBefore,
             `${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
+          const e = await enhanceRefuses(bytes, { error: 'mp3-tag-in-audio', detail: { at: where } });
+          check(`...the same through /enhance: 415 mp3-tag-in-audio {at: ${where}}, nothing written`, e === '', e);
           const f = await writeTmp(bytes, '.mp3');
           const walked = await mp3Frames.mp3Leftovers(f);
           await rm(f, { force: true });
@@ -458,11 +496,14 @@ async function endpoints() {
       const plain = path.join(tmp, 'placed-stereo.mp3');
       const pb = await readFile(plain);
       const at = Number((await sh('ffprobe', ['-v', 'error', '-select_streams', 'a', '-show_entries', 'packet=pos', '-of', 'csv=p=0', plain])).trim().split('\n')[20]);
-      const realSanitize = media.sanitizeMp3;
+      // (the decoder logs an error at the tag, so the full decode, which would refuse it first, is sabotaged too: it
+      // measures 1 s and passes)
+      const realSanitize = media.sanitizeMp3, realMeasure = limits.trueDuration;
       media.sanitizeMp3 = async (i, o) => { await copyFile(i, o); return { frames: 0, removed: {} }; };
+      limits.trueDuration = async () => ({ audioSec: [1], videoFrames: null, spanSec: 1, over: false, why: [] });
       let c;
-      try { c = await call('/strip-metadata', Buffer.concat([pb.subarray(0, at), id3['v2.3'](SECRET), pb.subarray(at)])); } finally { media.sanitizeMp3 = realSanitize; }
-      check('with the input rebuild sabotaged, the OUTPUT walk refuses: 500 metadata-survived (1 leftover), nothing written (fails if the strict walk is removed)',
+      try { c = await call('/strip-metadata', Buffer.concat([pb.subarray(0, at), id3['v2.3'](SECRET), pb.subarray(at)])); } finally { media.sanitizeMp3 = realSanitize; limits.trueDuration = realMeasure; }
+      check('with the input rebuild and the decode check sabotaged, the OUTPUT walk refuses: 500 metadata-survived (1 leftover), nothing written (fails if the strict walk is removed)',
         c.r.statusCode === 500 && c.json?.error === 'metadata-survived' && c.json.detail?.leftovers === 1 && c.uploaded === null, `${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
     }
     // ...and holds it to ONE stream: 44.1 kHz frames then 48 kHz frames, every byte a frame, is refused by the input
@@ -474,10 +515,12 @@ async function endpoints() {
       const refused = await call('/strip-metadata', two);
       check(`two streams (44.1 kHz then 48 kHz frames): 415 {error: mp3-structure, detail {at: ${first.length}}}, nothing written`,
         refused.r.statusCode === 415 && JSON.stringify(refused.json) === JSON.stringify({ error: 'mp3-structure', detail: { at: first.length } }) && refused.uploaded === null, `${refused.r.statusCode} ${refused.r.body.slice(0, 120)}`);
-      const realSanitize = media.sanitizeMp3;
+      // (the full decode logs an error at the rate change and would refuse it first: sabotaged too)
+      const realSanitize = media.sanitizeMp3, realMeasure = limits.trueDuration;
       media.sanitizeMp3 = async (i, o) => { await copyFile(i, o); return { frames: 0, removed: {} }; };
+      limits.trueDuration = async () => ({ audioSec: [1], videoFrames: null, spanSec: 1, over: false, why: [] });
       let c;
-      try { c = await call('/strip-metadata', two); } finally { media.sanitizeMp3 = realSanitize; }
+      try { c = await call('/strip-metadata', two); } finally { media.sanitizeMp3 = realSanitize; limits.trueDuration = realMeasure; }
       check('two streams with the input rebuild sabotaged: the OUTPUT walk refuses, 500 metadata-survived (1 leftover), nothing written (fails if the walk accepts a second stream)',
         c.r.statusCode === 500 && c.json?.error === 'metadata-survived' && c.json.detail?.leftovers === 1 && c.uploaded === null, `${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
     }
@@ -787,7 +830,6 @@ async function endpoints() {
     // each HARD limit on its own: the real command line (lib/commands) on an input over its cap — the measuring that normally refuses such input first is bypassed
     const commands = require('../lib/commands');
     const proc = require('../lib/proc');
-    const limits = require('../lib/limits');
     const ten = path.join(tmp, 'ten.wav'), tenV = path.join(tmp, 'ten.mp4'), noisy = path.join(tmp, 'noisy.mp4');
     await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'sine=duration=10', ten]);
     await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'testsrc=duration=10:size=64x48:rate=10', '-f', 'lavfi', '-i', 'sine=duration=10', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', tenV]);
@@ -1192,6 +1234,18 @@ async function endpoints() {
     const realSecretOk = guards.secretOk;
     const json = { ...H, 'content-type': 'application/json' };
     const asked = {};
+    // the HTTP parser's own refusals happen before Fastify has a request, so they need a real socket (inject skips
+    // the parser): raw bytes in, the raw reply back
+    await app.listen({ port: 0, host: '127.0.0.1' });
+    const port = app.server.address().port;
+    const raw = (bytes) => new Promise((resolve, reject) => {
+      const sock = require('net').connect(port, '127.0.0.1', () => sock.end(bytes));
+      const got = [];
+      sock.on('data', (c) => got.push(c));
+      sock.on('error', reject);
+      sock.on('close', () => resolve(Buffer.concat(got).toString('latin1')));
+    });
+    const rawAsked = {};
     stream.write = function (line) { written.push(String(line)); return true; };
     try {
       asked.notJson = await app.inject({ method: 'POST', url: '/strip-metadata?token=SECRETTOKEN', headers: json, payload: `{"sourceUrl": "${loud}", oops` });
@@ -1199,6 +1253,11 @@ async function endpoints() {
       asked.oversized = await app.inject({ method: 'POST', url: '/strip-metadata', headers: json, payload: JSON.stringify({ sourceUrl: loud.repeat(Math.ceil(1.2e6 / loud.length)) }) });
       asked.unknown = await app.inject({ method: 'POST', url: `/no-such-route/${encodeURIComponent(MARKERS[0])}?token=SECRETTOKEN&k=sk_live_FIXTURE0000`, headers: json, payload: { sourceUrl: loud } });
       asked.unknownNoSecret = await app.inject({ method: 'GET', url: `/Fixtureville/${encodeURIComponent(MARKERS[0])}?token=SECRETTOKEN` });
+      // Astra's P2 on #4 (2026-11-01): a path Fastify can't decode got its default FST_ERR_BAD_URL body, path and all
+      asked.badUrl = await app.inject({ method: 'POST', url: `/strip-metadata/${encodeURIComponent(MARKERS[0])}%zz?token=SECRETTOKEN`, headers: json, payload: { sourceUrl: loud } });
+      rawAsked.badHeader = await raw(`POST /strip-metadata?token=SECRETTOKEN HTTP/1.1\r\nHost: x\r\nX ${MARKERS[0]}: ${loud}\r\n\r\n`);
+      rawAsked.badRequestLine = await raw(`${loud} /${MARKERS[0]}?token=SECRETTOKEN HTTP/1.1\r\nHost: x\r\n\r\n`);
+      rawAsked.headerOverflow = await raw(`POST /strip-metadata?token=SECRETTOKEN HTTP/1.1\r\nHost: x\r\nX-Fixture: ${loud.repeat(Math.ceil(20000 / loud.length))}\r\n\r\n`);
       guards.secretOk = () => { throw new Error(`hook failed: ${loud}`); };
       asked.hookThrows = await app.inject({ method: 'POST', url: '/strip-metadata?token=SECRETTOKEN', headers: json, payload: { sourceUrl: loud } });
       await new Promise((r) => setImmediate(r)); // the "request completed" lines
@@ -1218,16 +1277,22 @@ async function endpoints() {
       ['a route the worker doesn\'t have, markers in its path and query', 'unknown', 404, '{"error":"not-found"}'],
       ['an unknown route without the secret (the secret is checked before routing)', 'unknownNoSecret', 401, '{"error":"unauthorized"}'],
       ['the secret check throwing before any handler (a pre-handler failure)', 'hookThrows', 500, '{"error":"internal"}'],
+      ['a path Fastify can\'t decode (a malformed percent-escape), a marker in it', 'badUrl', 400, '{"error":"bad-request"}'],
     ]) {
       const res = asked[key];
       check(`${label} → ${status} ${body} exactly, no marker in the reply`, res.statusCode === status && res.body === body && leaks(res.body).length === 0, `${res.statusCode} ${res.body.slice(0, 160)}`);
     }
-    check(`what pino wrote for those ${Object.keys(asked).length} requests (${written.length} lines): no marker, plain or URL-encoded, anywhere`, written.length >= 12 && leaks(w).length === 0, `${leaks(w).join(', ')} ${w.slice(0, 300)}`);
+    const RAW_REPLY = 'HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 23\r\nConnection: close\r\n\r\n{"error":"bad-request"}';
+    for (const [label, key] of [['a malformed header line', 'badHeader'], ['a malformed request line', 'badRequestLine'], ['headers over the parser\'s limit (20 KB)', 'headerOverflow']]) {
+      check(`raw HTTP, ${label}, markers in it → exactly a 400 {error: bad-request} reply, no marker`, rawAsked[key] === RAW_REPLY, JSON.stringify(rawAsked[key].slice(0, 200)));
+    }
+    check(`what pino wrote for those ${Object.keys(asked).length + Object.keys(rawAsked).length} requests (${written.length} lines): no marker, plain or URL-encoded, anywhere`, written.length >= 17 && leaks(w).length === 0, `${leaks(w).join(', ')} ${w.slice(0, 300)}`);
     check('...every line a listed message, every request as {method, route} only (route "unmatched" for the unknown ones), no err text',
       parsed.every((l) => l && logging.MESSAGES.has(l.msg) && (!l.req || JSON.stringify(Object.keys(l.req)) === '["method","route"]') && (!l.err || JSON.stringify(Object.keys(l.err)) === '["code"]'))
-        && parsed.filter((l) => l.msg === 'incoming request' && l.req.route === 'unmatched').length === 2,
+        && parsed.filter((l) => l.msg === 'incoming request' && l.req.route === 'unmatched').length === 3,
       written.slice(0, 4).join(''));
-    check('...each refusal logged by its handler, as route, status and code', ['"route":"/strip-metadata","status":400,"error":"bad-request"', '"route":"unmatched","status":404,"error":"not-found"', '"route":"/strip-metadata","status":500,"error":"internal"'].every((s) => w.includes(s)), w.slice(0, 300));
+    check('...each refusal logged by its handler, as route, status and code (the parser\'s three and the bad URL as "unmatched")', ['"route":"/strip-metadata","status":400,"error":"bad-request"', '"route":"unmatched","status":404,"error":"not-found"', '"route":"/strip-metadata","status":500,"error":"internal"'].every((s) => w.includes(s))
+      && written.filter((l) => l.includes('"route":"unmatched","status":400,"error":"bad-request"')).length === 4, w.slice(0, 300));
     // the logger on its own, for the lines Fastify writes that a test can't easily provoke: an Error as the message
     // (its hooks' failures), a message with the URL in it ("Reply was already sent…"), a request with a query and
     // headers, an err with a stack and a listed code, and the startup line
