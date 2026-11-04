@@ -567,6 +567,40 @@ async function endpoints() {
             `walked=${JSON.stringify(walked)} ${s.r.statusCode} ${s.r.body.slice(0, 120)}`);
         }
       }
+      // Astra's P1 (2026-11-03): non-Latin text, as a real tagger writes it. ffmpeg's ID3v1 is UTF-8: a Japanese title
+      // cut at the field's 30 bytes mid-character, and a Cyrillic one. Inside a middle frame: refused by the input
+      // rebuild through both endpoints, and named by the output walk on its own (given the bytes, and with the
+      // rebuild sabotaged). After the audio (the positive control): removed, 200, none of its text kept
+      for (const [lang, title, artist] of [['Japanese', 'A東京の夜明けとフィクスチャー村の記録', 'テスト歌手'], ['Cyrillic', 'Фикстурвиль: запись у реки', 'Тестовый Артист']]) {
+        const tf = path.join(tmp, `v1-${lang}-${who}.mp3`);
+        await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'sine=d=1', '-metadata', `title=${title}`, '-metadata', `artist=${artist}`, '-c:a', 'libmp3lame', '-write_id3v1', '1', tf]);
+        const t = (await readFile(tf)).subarray(-128);
+        const text = Buffer.from(artist, 'utf8');
+        const madeByFfmpeg = t.subarray(0, 3).toString('latin1') === 'TAG' && t.includes(text) && (lang !== 'Japanese' || (t[31] === 0xe3 && t[32] === 0x82)); // cut mid-character
+        const bytes = Buffer.from(pb);
+        const where = mid.pos + mid.size - 128;
+        t.copy(bytes, where);
+        const dirsBefore = (await jobDirs()).length;
+        const c = await call('/strip-metadata', bytes);
+        check(`a ${lang} ID3v1 written by ffmpeg (UTF-8) inside a middle frame, ${who} → REFUSED 415 {error: mp3-tag-in-audio, detail: {at: ${where}}}, nothing written`,
+          madeByFfmpeg && c.r.statusCode === 415 && JSON.stringify(c.json) === JSON.stringify({ error: 'mp3-tag-in-audio', detail: { at: where } }) && c.uploaded === null && (await jobDirs()).length === dirsBefore,
+          `made=${madeByFfmpeg} ${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
+        const e = await enhanceRefuses(bytes, { error: 'mp3-tag-in-audio', detail: { at: where } });
+        check(`...the same through /enhance: 415 mp3-tag-in-audio {at: ${where}}, nothing written`, e === '', e);
+        const f = await writeTmp(bytes, '.mp3');
+        const walked = await mp3Frames.mp3Leftovers(f);
+        await rm(f, { force: true });
+        const realSanitize = media.sanitizeMp3;
+        media.sanitizeMp3 = async (i, o) => { await copyFile(i, o); return { frames: 0, removed: {} }; };
+        let sab;
+        try { sab = await call('/strip-metadata', bytes); } finally { media.sanitizeMp3 = realSanitize; }
+        check(`...the output walk alone names it (id3v1); with the input rebuild sabotaged, 500 metadata-survived (1 leftover), nothing written`,
+          JSON.stringify(walked) === '["id3v1"]' && sab.r.statusCode === 500 && sab.json?.error === 'metadata-survived' && sab.json.detail?.leftovers === 1 && sab.uploaded === null,
+          `walked=${JSON.stringify(walked)} ${sab.r.statusCode} ${sab.r.body.slice(0, 120)}`);
+        const after = await call('/strip-metadata', Buffer.concat([pb, t]));
+        check(`positive control: the same ${lang} ID3v1 after the audio, ${who} → 200, removed, none of its text kept`,
+          after.r.statusCode === 200 && exact(after.json) && !after.uploaded.includes(text) && !after.uploaded.includes(Buffer.from(title.slice(1, 4), 'utf8')), `${after.r.statusCode} ${after.r.body.slice(0, 120)}`);
+      }
     }
     // the OUTPUT walk stands on its own: with the input rebuild sabotaged into a plain copy, a tag between frames
     // reaches the remux, ffmpeg keeps it, and the output walk refuses — 500 metadata-survived, nothing written
@@ -635,6 +669,9 @@ async function endpoints() {
         ['TAG, a title with a control byte (0x01) in it, zeros', pad(Buffer.from('TAGTrack\x011', 'latin1'))],
         ['TAG, an album with a C1 byte (0x85) in it, zeros', pad(Buffer.concat([Buffer.from('TAG', 'latin1'), Buffer.alloc(60), Buffer.from([0x41, 0x85])]))],
         ['TAG, a comment with DEL (0x7f) in it, zeros', pad(Buffer.concat([Buffer.from('TAG', 'latin1'), Buffer.alloc(94), Buffer.from([0x7f])]))],
+        ['TAG, a title with a lone UTF-8 continuation byte (A, 0x80)', pad(Buffer.from('TAGA\x80', 'latin1'))],
+        ['TAG, a title with an encoded surrogate (ED A0 80, not UTF-8)', pad(Buffer.from('544147eda080', 'hex'))],
+        ['TAG, a title with UTF-8 for a C1 control (C2 85)', pad(Buffer.from('544147c285', 'hex'))],
         ['ID3 v2.3 of size 0, then zeros', pad(Buffer.from('ID3\x03\x00\x00\x00\x00\x00\x00', 'latin1'))],
         ['ID3 v2.4 whose body is zeros (padding only)', pad(Buffer.concat([Buffer.from('ID3\x04\x00\x00', 'latin1'), Buffer.from([0, 0, 0, 60])]))],
       ];
@@ -645,6 +682,8 @@ async function endpoints() {
         ['Sandy\'s set\'s own bytes: TAG ßG}2oô, then zeros (rule A refuses that file)', pad(Buffer.from('544147df477d326ff4', 'hex')), 'id3v1'],
         ['TAG with a five-character title ("Lagos")', pad(Buffer.from('TAGLagos', 'latin1')), 'id3v1'],
         ['TAG with a non-ASCII Latin-1 title ("Café Ñandú")', pad(Buffer.from('TAGCafé Ñandú', 'latin1')), 'id3v1'],
+        ['TAG with a UTF-8 title ("東京", "Москва"), a C1-range continuation byte in it', pad(Buffer.concat([Buffer.from('TAG', 'latin1'), Buffer.from('東京 Москва', 'utf8')])), 'id3v1'],
+        ['TAG with a UTF-8 title cut mid-character by a NUL', pad(Buffer.concat([Buffer.from('TAG', 'latin1'), Buffer.from('東京', 'utf8').subarray(0, 5)])), 'id3v1'],
         ['TAG with every text field empty (her refinement, measured and not kept)', pad(Buffer.from('TAG', 'latin1')), 'id3v1'],
         ['TAG with a shortened title (its text, a NUL, the old text\'s tail)', pad(Buffer.from('TAGLagos\x00Fixtureville', 'latin1')), 'id3v1'],
         ['TAG with a title of 8 letters and digits ("Track 123")', pad(Buffer.from('TAGTrack 123', 'latin1')), 'id3v1'],
