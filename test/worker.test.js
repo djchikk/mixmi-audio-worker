@@ -700,6 +700,12 @@ async function endpoints() {
             `same=${sameStream} ${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
         }
       };
+      // kept as it is: the rebuild byte-equal to the input, every frame counted whole, nothing trimmed
+      const asIs = async (label, bytes) => {
+        const r = await rebuild(bytes);
+        check(`${rate} Hz, ${label}: kept as it is, the rebuild byte-equal to the input (${hp.length} frames, none trimmed)`,
+          sameStream && r.out?.equals(bytes) && r.frames === hp.length && r.cutFrame === 0, JSON.stringify({ ...r, out: r.out?.length }));
+      };
       // a chance header inside the cut frame: the remains with a header written into them, its frame fitting but
       // followed by 0x55 filler (as quiet frames have), or running past the end
       const chance = (at, header, fill) => { const b = Buffer.from(cut); header.copy(b, last.pos + at); if (fill !== undefined) b.fill(0x55, fill, fill + 4); return b; };
@@ -743,6 +749,33 @@ async function endpoints() {
       check(`${rate} Hz, the crafted Layer II frame is one (${layer2.length} bytes) and fits inside the cut ${hi} frame after a whole ${lo} one`, mp3Frames.frameAt(l2h).stream.split('.')[1] === '2' && keep + loFrame.length + layer2.length < last.size);
       await trimmed(`a whole Layer II frame (${layer2.length} bytes, not looked for) inside that cut frame, to the end`, Buffer.concat([cut, layer2]));
       await refused(`its last ${hi} frame cut, a whole ${lo} frame, then a whole Layer II frame`, Buffer.concat([cut, loFrame, layer2]), cut.length);
+      // Astra's P2 on 56b93cef (2026-11-04): a cut frame, then complete frames that fill its declared length TO THE BYTE.
+      // The walk counts it as one whole last frame (promise 3: nothing in the bytes tells it from a whole frame whose
+      // audio holds a header). The chain check: complete frames inside the last frame, one after another, ending exactly
+      // where it ends, refuse the file at the first. Its boundaries: one byte short is a cut frame (the rule above);
+      // one byte over leaves the walk inside the whole frame's last byte; a byte or zero bytes after the chain, a chain
+      // inside the last frame KEPT before a trimmed cut one, are not followed (measured: they refuse honest files)
+      const L = last.size, n = loFrame.length, upTo = (len) => hb.subarray(0, last.pos + len);
+      await asIs('the whole file (the positive control)', hb);
+      await refused(`its last ${hi} frame cut to ${L - n} of its ${L} bytes, then a whole ${lo} frame (${n} bytes) filling it to the byte, to the end`, Buffer.concat([upTo(L - n), loFrame]), last.pos + L - n);
+      await refused(`its last ${hi} frame cut to ${L - 2 * n} bytes, then two whole ${lo} frames filling it to the byte`, Buffer.concat([upTo(L - 2 * n), loFrame, loFrame]), last.pos + L - 2 * n);
+      await refused(`its last ${hi} frame cut to ${L - n} bytes, a whole ${lo} frame filling it, then an ID3v1 tag (read back from the end)`, Buffer.concat([upTo(L - n), loFrame, v1('x')]), last.pos + L - n);
+      await refused(`its last ${hi} frame cut to ${L - n} bytes, a whole ${lo} frame filling it, then an ID3 v2.3 tag (walked over)`, Buffer.concat([upTo(L - n), loFrame, id3['v2.3']('x')]), last.pos + L - n);
+      {
+        // one byte over: the whole frame ends one byte before the end of the ${lo} frame; the walk goes on at that byte,
+        // zero (dropped) or not (unaccounted)
+        const bytes = Buffer.concat([upTo(L - n + 1), loFrame]), r = await rebuild(bytes), z = loFrame[n - 1] === 0;
+        check(`${rate} Hz, one byte over: its last ${hi} frame cut to ${L - n + 1} bytes, then a whole ${lo} frame: the walk goes on at its last byte (${loFrame[n - 1]}): ${z ? 'a zero byte, dropped, the rest kept as it is' : 'refused there (mp3-structure)'}`,
+          z ? r.out?.equals(bytes.subarray(0, -1)) && r.frames === hp.length : r.code === `mp3-structure {"at":${last.pos + L}}`, JSON.stringify({ ...r, out: r.out?.length }));
+      }
+      await asIs(`its last ${hi} frame cut to ${L - n - 1} bytes, a whole ${lo} frame, then one 0x55 byte filling it (the chain ends a byte early)`, Buffer.concat([upTo(L - n - 1), loFrame, Buffer.from([0x55])]));
+      await asIs(`its last ${hi} frame cut to ${L - n - 20} bytes, a whole ${lo} frame, then 20 zero bytes filling it (zeros after the chain are not followed)`, Buffer.concat([upTo(L - n - 20), loFrame, Buffer.alloc(20)]));
+      await asIs(`its last ${hi} frame cut to ${L - layer2.length} bytes, then a whole Layer II frame (${layer2.length} bytes, not looked for) filling it to the byte`, Buffer.concat([upTo(L - layer2.length), layer2]));
+      {
+        const head = Buffer.concat([upTo(L - n), loFrame]), bytes = Buffer.concat([head, hb.subarray(last.pos, last.pos + keep)]), r = await rebuild(bytes);
+        check(`${rate} Hz, its last ${hi} frame cut to ${L - n} bytes and filled by a whole ${lo} frame, then the ${hi} frame again, cut: that one trimmed, the filled one kept as it is (a chain in the last frame KEPT is not looked for)`,
+          r.out?.equals(head) && r.frames === hp.length && r.cutFrame === 1, JSON.stringify({ ...r, out: r.out?.length }));
+      }
       // the measured cost of refusing free-format outright: quiet and tonal frames' 0xFF filler holds free-format headers
       // by chance (FF F3 03 at the end of a run, here). This sine's last frame holds one: cut past it, the file is
       // refused, at it. Found by the test's own reading of the bytes (Layer III sync and layer bits, bitrate index 0)
@@ -753,6 +786,10 @@ async function endpoints() {
         check(`${rate} Hz, the sine's last frame holds a chance free-format header (at ${ffq}), past the positive control's ${keep} bytes`, ffq > keep);
         await refused(`its last ${hi} frame cut to ${ffq + 20} bytes, past a chance free-format header in it`, hb.subarray(0, last.pos + ffq + 20), last.pos + ffq);
       } else check(`${rate} Hz, the sine's last frame holds no free-format header before the positive control's ${keep} bytes`, ffq < 0 || ffq + 4 > keep, `at ${ffq}`);
+      // the filled frame's boundary one byte short (Astra's P2 on 56b93cef): a cut frame, so the rule above refuses it, at
+      // the whole ${lo} frame; or, at 44.1 kHz, earlier, at the chance free-format header in the sine's last frame
+      const short = L - n - 1, at1 = ffq >= 0 && ffq + 4 <= short ? ffq : short;
+      await refused(`one byte short: its last ${hi} frame cut to ${short} bytes, then a whole ${lo} frame (a cut frame: the rule above, refused at ${at1 === short ? `the ${lo} frame` : 'the chance free-format header'})`, Buffer.concat([upTo(short), loFrame]), last.pos + at1);
     }
     // fade-to-silence endings (the Reviewer, 2026-11-03): quiet frames' filler holds headers of the stream by chance
     // (two corpus encodes refused 3.8% and 5.9% of their honest cuts by the rule before this one). Tone bursts fading into
@@ -863,6 +900,100 @@ async function endpoints() {
       const enough = seen.trimmed >= 100 && seen.refused >= 300 && seen.free >= 30 && seen.versions.size === 3 && seen.zeros >= 100 && Object.values(seen.tags).every((n) => n >= 100);
       check(`generated tails, ${seen.trimmed + seen.refused}: ${seen.refused} with 1–3 complete frames after the cut one (${seen.free} free-format first; MPEG ${[...seen.versions].map((v) => ({ 3: '1', 2: '2', 0: '2.5' })[v]).join(', ')}), each refused at the first; ${seen.trimmed} with none, each trimmed byte-equal to the whole frames before it. Tags per kind: ${Object.entries(seen.tags).map(([k2, n]) => `${k2} ${n}`).join(', ')}; zero bytes in ${seen.zeros}`,
         wrong.length === 0 && enough, `${wrong.length} wrong: ${wrong.slice(0, 4).join(' | ')}${enough ? '' : ' (and too few of some kind)'}`);
+
+      // ...and tails that reach the cut frame's declared end D (Astra's P2 on 56b93cef, 2026-11-04; the tails above all
+      // end inside it). Half fill it EXACTLY (its prefix, 0–3 complete frames and any zero bytes, to the byte; the tags
+      // after); half run past it, D landing at a frame boundary or anywhere in the frames and zeros. The walk counts the
+      // cut frame COMPLETE (promise 3: its bytes are audio, nothing tells them apart) and goes on at D. Expected, by the
+      // test's own walk over the pieces it built: from D, whole measured frames of the file's stream are kept, ID3v2 and
+      // APE-with-header tags skipped, zero bytes dropped; anything else (another stream's frame, a free-format one,
+      // mid-frame bytes, a tag only read back from the end) refuses at it (mp3-structure). With no frame kept after D,
+      // the cut frame is the last: complete frames inside it, one after another to D exactly, refuse at the first of
+      // them (the chain check); otherwise it is kept as it is.
+      // At most 3 tags each, so the trailers read back from the end stay within endOfAudio's 8
+      const WALKED = new Set(['ID3 v2.2', 'ID3 v2.3', 'ID3 v2.4', 'ID3 v2.4 with a footer', 'APE with its header']);
+      const TRAILER = new Set(['ID3 v2.4 with a footer', 'ID3v1', 'APE (footer only)', 'APE with its header', 'Lyrics3 v2', 'Lyrics3 v1 and its ID3v1']);
+      const met = { 'filled, refused (a chain to D)': 0, 'filled, kept as it is': 0, 'past, kept on after D': 0, 'past, kept as it is': 0, 'past, refused on the walk': 0, 'past, refused (a chain to D)': 0 };
+      const tagsPast = Object.fromEntries(Object.keys(TAGS).map((k) => [k, 0]));
+      let freePast = 0, skipped = 0;
+      const wrong2 = [];
+      for (let t = 0; t < 1600; t++) {
+        const base = bases[t % 3], filled = t % 2 === 0;
+        const whole = Buffer.concat(Array.from({ length: 4 }, () => frame({ ver: base.ver, sri: base.sri, bri: 1 + Math.floor(rnd() * 14), pad: rnd() < 0.5 ? 1 : 0, mode: Math.floor(rnd() * 4) })));
+        const cutFrame = frame({ ...base, mode: Math.floor(rnd() * 4) });
+        const tags = Object.keys(TAGS).filter(() => rnd() < 0.25).sort(() => rnd() - 0.5).slice(0, 3);
+        const complete = Array.from({ length: filled ? Math.floor(rnd() * 4) : 1 + Math.floor(rnd() * 3) }, () => {
+          // (past D, three in four of them the file's own stream, or the walk refuses nearly every one at its first frame)
+          const own = !filled && rnd() < 0.75, ver = own ? base.ver : pick([3, 2, 0]), sri = own ? base.sri : Math.floor(rnd() * 3), free = rnd() < 0.2;
+          return { f: frame({ ver, sri, bri: free ? 0 : 1 + Math.floor(rnd() * 14), pad: rnd() < 0.5 ? 1 : 0, crc: rnd() < 0.3, mode: Math.floor(rnd() * 4), len: 40 + Math.floor(rnd() * 160) }), free, ours: ver === base.ver && sri === base.sri };
+        });
+        const zeros = rnd() < 0.3 ? 1 + Math.floor(rnd() * 24) : 0;
+        const framesLen = complete.reduce((a, c) => a + c.f.length, 0), body = framesLen + zeros;
+        // where D lands, counted from the first complete frame: the end of the zeros (filled); or a later frame's start,
+        // the frames' end or the zeros' end, else any byte after the first frame's start
+        let rel = body;
+        if (!filled) {
+          const starts = [];
+          for (let i = 1, o = 0; i < complete.length; i++) starts.push((o += complete[i - 1].f.length));
+          const r = rnd();
+          rel = r < 0.4 && starts.length ? pick(starts) : r < 0.65 ? pick([framesLen, body]) : 1 + Math.floor(rnd() * body);
+        }
+        const k = cutFrame.length - 4 - rel;
+        if (k < 0) continue;
+        const cutAt = whole.length, D = cutAt + cutFrame.length;
+        // the pieces, where they start
+        const pieces = [];
+        let at = cutAt + 4 + k;
+        for (const c of complete) { pieces.push({ at, len: c.f.length, frame: !c.free, free: c.free, ours: c.ours, f: c.f }); at += c.f.length; }
+        at += zeros;
+        const tagBytes = tags.map((name) => { const b = TAGS[name](); pieces.push({ at, len: b.length, tag: name }); at += b.length; return b; });
+        const bytes = Buffer.concat([whole, cutFrame.subarray(0, 4 + k), ...complete.map((c) => c.f), Buffer.alloc(zeros), ...tagBytes]);
+        // the audio's end: before the trailers read back from the end. Skipped (counted): a tail where "TAG" sits 128
+        // bytes before one of those ends by chance (in "APETAGEX"), not an ID3v1's start: endOfAudio reads it as one
+        // (it refuses, safe), and that is the read-back's own test, not this one's
+        let audioEnd = bytes.length, chanceTag = false;
+        const tagAt128 = (e) => e >= 128 && bytes.toString('latin1', e - 128, e - 125) === 'TAG';
+        for (let i = tags.length - 1; ; i--) {
+          const name = tags[i], trailer = i >= 0 && TRAILER.has(name);
+          if (tagAt128(audioEnd) && !(trailer && /ID3v1/.test(name))) { chanceTag = true; break; }
+          if (!trailer) break;
+          if (name === 'Lyrics3 v1 and its ID3v1' && tagAt128(audioEnd - 128)) { chanceTag = true; break; }
+          audioEnd = pieces[pieces.length - tags.length + i].at;
+        }
+        if (chanceTag) { skipped++; continue; }
+        // the expected outcome: the test's own walk from D
+        let want, kind;
+        {
+          const after = [];
+          let p = D;
+          while (p < audioEnd && !want) {
+            const pc = pieces.find((x) => x.at === p);
+            if (pc?.frame && pc.ours) { after.push(pc); p += pc.len; } else if (pc?.tag && WALKED.has(pc.tag)) p += pc.len;
+            else if (bytes[p] === 0) p++;
+            else { want = { code: `mp3-structure {"at":${p}}` }; kind = 'past, refused on the walk'; }
+          }
+          if (!want && !after.length) {
+            // the chain: the complete frames inside the cut one, the last ending at D, every one measured
+            const inside = pieces.filter((x) => (x.frame || x.free) && x.at + x.len <= D);
+            let i = inside.findIndex((x) => x.at + x.len === D);
+            if (i >= 0 && inside[i].frame) while (i > 0 && inside[i - 1].frame) i--;
+            else i = -1;
+            if (i >= 0) { want = { code: `mp3-structure {"at":${inside[i].at}}` }; kind = filled ? 'filled, refused (a chain to D)' : 'past, refused (a chain to D)'; }
+          }
+          if (!want) {
+            want = { out: Buffer.concat([whole, bytes.subarray(cutAt, D), ...after.map((x) => x.f)]), frames: 5 + after.length };
+            kind = filled ? 'filled, kept as it is' : after.length ? 'past, kept on after D' : 'past, kept as it is';
+          }
+        }
+        const r = await rebuild(bytes);
+        const right = want.code ? r.code === want.code : r.out?.equals(want.out) && r.frames === want.frames && r.cutFrame === 0;
+        if (!right) wrong2.push(`#${t} ${kind}, D ${D}, ${complete.length} frames${complete.some((c) => c.free) ? ' (free-format among them)' : ''}, ${zeros} zeros, tags ${tags.join('+') || 'none'}: want ${want.code ?? `${want.frames} frames`}, got ${r.code ?? `${r.frames} frames, ${r.out?.length} bytes, cut ${r.cutFrame}`}`);
+        met[kind] = (met[kind] || 0) + 1;
+        if (!filled) { tags.forEach((k2) => tagsPast[k2]++); if (complete.some((c) => c.free)) freePast++; }
+      }
+      const enough2 = Object.values(met).every((n) => n >= 40) && freePast >= 30 && Object.values(tagsPast).every((n) => n >= 20) && skipped <= 16;
+      check(`generated tails reaching the cut frame's end, ${Object.values(met).reduce((a, b) => a + b, 0)}: ${Object.entries(met).map(([k2, n]) => `${k2} ${n}`).join(', ')}; free-format in ${freePast} of those past it; each as the test's own walk expects (${skipped} skipped: a chance "TAG" 128 bytes from a trailer's start)`,
+        wrong2.length === 0 && enough2, `${wrong2.length} wrong: ${wrong2.slice(0, 4).join(' | ')}${enough2 ? '' : ` (and too few of some kind: ${JSON.stringify({ met, freePast, tagsPast })})`}`);
     }
     // near misses from real audio (Sandy's 94-minute set, 2026-11-01, refused at byte 45,522,714 by this check's
     // first version): quiet frames are mostly zero bytes, so a chance "ID3" there reads as a well-formed EMPTY tag.
