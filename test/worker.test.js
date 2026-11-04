@@ -665,8 +665,8 @@ async function endpoints() {
       const f = await writeTmp(bytes, '.mp3'), o = `${f}.frames`;
       try { const r = await mp3Frames.sanitizeMp3(f, o); return { frames: r.frames, cutFrame: r.removed.cutFrame, out: await readFile(o) }; } catch (e) { return { code: `${e.workerCode} ${JSON.stringify(e.workerDetail)}` }; } finally { await rm(f, { force: true }); await rm(o, { force: true }); }
     };
-    for (const [rate, hi, lo, keep, ms] of [[8000, '64k', '8k', 200, 72], [44100, '320k', '32k', 300, 26]]) {
-      const enc = async (br) => { const f = path.join(tmp, `vbr-${rate}-${br}.mp3`); await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', `sine=frequency=440:duration=2:sample_rate=${rate}`, '-ar', String(rate), '-ac', '1', '-c:a', 'libmp3lame', '-b:a', br, '-write_xing', '0', '-id3v2_version', '0', '-write_id3v1', '0', f]); return f; };
+    for (const [rate, hi, lo, keep, ms, otherRate] of [[8000, '64k', '8k', 200, 72, 12000], [44100, '320k', '32k', 300, 26, 48000]]) {
+      const enc = async (br, r = rate) => { const f = path.join(tmp, `vbr-${r}-${br}.mp3`); await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', `sine=frequency=440:duration=2:sample_rate=${r}`, '-ar', String(r), '-ac', '1', '-c:a', 'libmp3lame', '-b:a', br, '-write_xing', '0', '-id3v2_version', '0', '-write_id3v1', '0', f]); return f; };
       const hiF = await enc(hi), loF = await enc(lo);
       const hb = await readFile(hiF), hp = await pktsOf(hiF), lp = await pktsOf(loF);
       const last = hp[hp.length - 1], mid = hp[Math.floor(hp.length / 2)];
@@ -710,6 +710,18 @@ async function endpoints() {
       await refused(`its last ${hi} frame cut, a whole ${lo} frame, then zero bytes to the end`, Buffer.concat([cut, loFrame, Buffer.alloc(20)]), cut.length);
       await refused(`two cut frames: its last ${hi} frame cut, a whole ${lo} frame, then a cut one`, Buffer.concat([cut, loFrame, loFrame.subarray(0, loFrame.length - 10)]), cut.length);
       await refused(`two cut frames: one in the middle (50 bytes short), and the last`, Buffer.concat([hb.subarray(0, mid.pos + mid.size - 50), hb.subarray(mid.pos + mid.size, last.pos + keep)]), mid.pos + mid.size);
+      // (the Reviewer's gaps on e485bf92) a complete frame confirmed by ONE byte, 0xFF, at the very end (the next
+      // header's first byte): refused, promise 1. Its control: the same with a 0x55 byte instead, nothing confirming it: trimmed
+      await refused(`its last ${hi} frame cut, a whole ${lo} frame, then one 0xFF byte ending the audio`, Buffer.concat([cut, loFrame, Buffer.from([0xff])]), cut.length);
+      await trimmed(`a whole ${lo} frame inside that cut frame, then one 0x55 byte ending the audio (the 0xFF case's control: nothing confirms it)`, Buffer.concat([cut, loFrame, Buffer.from([0x55])]));
+      // ...and a whole frame of ANOTHER stream (${otherRate} Hz) inside the cut frame, to the end: not a frame of this
+      // stream, so the cut frame's own bytes: trimmed. Its control: a whole frame of this stream there (Astra's case,
+      // refused above)
+      const otherF = await enc('32k', otherRate), op = await pktsOf(otherF);
+      const otherFrame = (await readFile(otherF)).subarray(op[1].pos, op[1].pos + op[1].size);
+      const otherStream = mp3Frames.frameAt(otherFrame).stream !== mp3Frames.frameAt(hb.subarray(last.pos)).stream && keep + otherFrame.length < last.size;
+      check(`${rate} Hz, the ${otherRate} Hz frame is another stream and fits inside the cut ${hi} frame (so the next check proves something)`, otherStream);
+      await trimmed(`a whole ${otherRate} Hz frame (another stream, ${otherFrame.length} bytes) inside that cut frame, to the end`, Buffer.concat([cut, otherFrame]));
     }
     // fade-to-silence endings (the Reviewer, 2026-11-03): quiet frames' filler holds headers of the stream by chance
     // (two corpus encodes refused 3.8% and 5.9% of their honest cuts by the rule before this one). Tone bursts fading into
