@@ -644,6 +644,39 @@ async function endpoints() {
       check('the output walk: frames only → []; +1 zero byte → mp3-unparsed; last frame cut → mp3-short-frame; a v2.4 tag after → id3v2; a zero byte first → mp3-unparsed',
         JSON.stringify(got) === JSON.stringify(['[]', '["mp3-unparsed"]', '["mp3-short-frame"]', '["id3v2"]', '["mp3-unparsed"]']), JSON.stringify(got));
     }
+    // exactly ONE cut frame is dropped, whatever its duration (Astra's P2s on #4, 2026-11-03: the rule is one incomplete
+    // final frame, not a time; the safety is that its bytes are dropped). At 8 kHz a frame is 72 ms, at 44.1 kHz 26 ms.
+    // VBR's case: a cut high-bitrate frame with a whole low-bitrate frame inside its remains dropped both; now a header
+    // of the stream inside the remains refuses the file (415 mp3-structure, at that header). Positive control: the
+    // cut frame alone gives 200 and exactly one frame fewer, the rest's packets equal
+    for (const [rate, hi, lo, keep, ms] of [[8000, '64k', '8k', 200, 72], [44100, '320k', '32k', 300, 26]]) {
+      const enc = async (br) => { const f = path.join(tmp, `vbr-${rate}-${br}.mp3`); await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', `sine=frequency=440:duration=2:sample_rate=${rate}`, '-ar', String(rate), '-ac', '1', '-c:a', 'libmp3lame', '-b:a', br, '-write_xing', '0', '-id3v2_version', '0', '-write_id3v1', '0', f]); return f; };
+      const pkts = async (f) => (await sh('ffprobe', ['-v', 'error', '-select_streams', 'a', '-show_entries', 'packet=pos,size', '-of', 'csv=p=0', f])).trim().split('\n')
+        .map((l) => { const [size, pos] = l.split(',').filter(Boolean).map(Number); return { pos, size }; });
+      const hiF = await enc(hi), loF = await enc(lo);
+      const hb = await readFile(hiF), hp = await pkts(hiF), lp = await pkts(loF);
+      const last = hp[hp.length - 1];
+      const loFrame = (await readFile(loF)).subarray(lp[1].pos, lp[1].pos + lp[1].size);
+      const cut = hb.subarray(0, last.pos + keep);
+      const sameStream = mp3Frames.frameAt(loFrame).stream === mp3Frames.frameAt(hb.subarray(last.pos)).stream && keep + loFrame.length < last.size;
+      const kept = path.join(tmp, `vbr-${rate}-kept.mp3`);
+      await writeFile(kept, hb.subarray(0, last.pos));
+      const count = async (f) => Number((await sh('ffprobe', ['-v', 'error', '-select_streams', 'a', '-count_packets', '-show_entries', 'stream=nb_read_packets', '-of', 'csv=p=0', f])).trim());
+      const one = await call('/strip-metadata', cut);
+      const out = one.uploaded && await writeTmp(one.uploaded, '.mp3');
+      check(`${rate} Hz, its last ${hi} frame (${ms} ms) cut to ${keep} bytes: 200, exactly one frame dropped (${hp.length} → ${hp.length - 1} packets), the rest's packets equal, clean frame to frame`,
+        one.r.statusCode === 200 && exact(one.json) && (await count(out)) === hp.length - 1 && (await packetHash(out)) === (await packetHash(kept)) && (await media.metadataReport(out, 'mp3')).clean,
+        `${one.r.statusCode} ${one.r.body.slice(0, 120)}`);
+      if (out) await rm(out, { force: true });
+      for (const [label, bytes] of [[`a whole ${lo} frame (${loFrame.length} bytes) inside its remains`, Buffer.concat([cut, loFrame])], [`a cut ${lo} frame inside its remains (a second incomplete frame)`, Buffer.concat([cut, loFrame.subarray(0, loFrame.length - 10)])], [`2 bytes of a ${lo} header ending its remains`, Buffer.concat([cut, loFrame.subarray(0, 2)])]]) {
+        for (const ep of ['/strip-metadata', '/enhance']) {
+          const c = await call(ep, bytes, ep === '/enhance' ? { body: { enhancementType: 'clean' } } : {});
+          check(`${rate} Hz, its last ${hi} frame cut, ${label}, ${ep} → REFUSED 415 {error: mp3-structure, detail: {at: ${cut.length}}}, nothing written`,
+            sameStream && c.r.statusCode === 415 && JSON.stringify(c.json) === JSON.stringify({ error: 'mp3-structure', detail: { at: cut.length } }) && c.uploaded === null,
+            `same=${sameStream} ${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
+        }
+      }
+    }
     // near misses from real audio (Sandy's 94-minute set, 2026-11-01, refused at byte 45,522,714 by this check's
     // first version): quiet frames are mostly zero bytes, so a chance "ID3" there reads as a well-formed EMPTY tag.
     // Each written over a middle frame's end: accepted by the input rebuild and clean to the output walk. Then the
