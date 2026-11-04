@@ -351,6 +351,13 @@ async function endpoints() {
       'v2.3': (text) => { const body = Buffer.concat([Buffer.from('TIT2', 'latin1'), Buffer.from([0, 0, 0, text.length + 1, 0, 0, 0]), Buffer.from(text, 'latin1')]); return Buffer.concat([Buffer.from('ID3\x03\x00\x00', 'latin1'), syncsafe4(body.length), body]); },
       'v2.4 with a footer': (text) => { const body = Buffer.concat([Buffer.from('TIT2', 'latin1'), syncsafe4(text.length + 1), Buffer.from([0, 0, 3]), Buffer.from(text, 'latin1')]); return Buffer.concat([Buffer.from('ID3\x04\x00\x10', 'latin1'), syncsafe4(body.length), body, Buffer.from('3DI\x04\x00\x10', 'latin1'), syncsafe4(body.length)]); },
     };
+    // the other trailers' builders: ID3v1 (genre 255, as taggers write it), APE (footer only, or header and footer), Lyrics3 v2
+    const v1 = (text) => { const b = Buffer.alloc(128); b.write('TAG', 0, 'latin1'); b.write(text, 3, 'latin1'); b[127] = 255; return b; };
+    const apeItem = (text) => { const item = Buffer.concat([Buffer.alloc(8), Buffer.from(`Title\0${text}`, 'latin1')]); item.writeUInt32LE(text.length, 0); return item; };
+    const apeBlock = (size, flags) => { const f = Buffer.alloc(32); f.write('APETAGEX', 0, 'latin1'); f.writeUInt32LE(2000, 8); f.writeUInt32LE(size, 12); f.writeUInt32LE(1, 16); f.writeUInt32LE(flags >>> 0, 20); return f; };
+    const ape = (text) => { const item = apeItem(text); return Buffer.concat([item, apeBlock(item.length + 32, 0)]); };
+    const apeWithHeader = (text) => { const item = apeItem(text); return Buffer.concat([apeBlock(item.length + 32, 0xa0000000), item, apeBlock(item.length + 32, 0x80000000)]); };
+    const lyrics2 = (text) => { const body = Buffer.from(`LYRICSBEGINLYR${String(text.length).padStart(5, '0')}${text}`, 'latin1'); return Buffer.concat([body, Buffer.from(`${String(body.length).padStart(6, '0')}LYRICS200`, 'latin1')]); };
     const remuxPlain = async (f) => { const o = `${f}.plain.mp3`; await sh('ffmpeg', ['-v', 'error', '-i', f, '-map', '0:a', '-c', 'copy', '-map_metadata', '-1', '-id3v2_version', '0', '-write_id3v1', '0', '-fflags', '+bitexact', o]); const b = await readFile(o); await rm(o, { force: true }); return b; };
     const channels = async (f) => Number((await sh('ffprobe', ['-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=channels', '-of', 'csv=p=0', f])).trim());
     const SECRET = 'Fixtureville GPS 51.5 -0.1';
@@ -418,12 +425,6 @@ async function endpoints() {
       const packets = (await sh('ffprobe', ['-v', 'error', '-select_streams', 'a', '-show_entries', 'packet=pos,size', '-of', 'csv=p=0', plain])).trim().split('\n')
         .map((l) => { const [size, pos] = l.split(',').filter(Boolean).map(Number); return { pos, size }; }); // ffprobe prints size, then pos
       const lastFrame = packets[packets.length - 1];
-      const v1 = (text) => { const b = Buffer.alloc(128); b.write('TAG', 0, 'latin1'); b.write(text, 3, 'latin1'); b[127] = 255; return b; };
-      const apeItem = (text) => { const item = Buffer.concat([Buffer.alloc(8), Buffer.from(`Title\0${text}`, 'latin1')]); item.writeUInt32LE(text.length, 0); return item; };
-      const apeBlock = (size, flags) => { const f = Buffer.alloc(32); f.write('APETAGEX', 0, 'latin1'); f.writeUInt32LE(2000, 8); f.writeUInt32LE(size, 12); f.writeUInt32LE(1, 16); f.writeUInt32LE(flags >>> 0, 20); return f; };
-      const ape = (text) => { const item = apeItem(text); return Buffer.concat([item, apeBlock(item.length + 32, 0)]); };
-      const apeWithHeader = (text) => { const item = apeItem(text); return Buffer.concat([apeBlock(item.length + 32, 0xa0000000), item, apeBlock(item.length + 32, 0x80000000)]); };
-      const lyrics2 = (text) => { const body = Buffer.from(`LYRICSBEGINLYR${String(text.length).padStart(5, '0')}${text}`, 'latin1'); return Buffer.concat([body, Buffer.from(`${String(body.length).padStart(6, '0')}LYRICS200`, 'latin1')]); };
       const kept = path.join(tmp, `kept-${who}.mp3`);
       await writeFile(kept, pb.subarray(0, lastFrame.pos)); // the input's frames without the last one
       const keptHash = await packetHash(kept);
@@ -653,10 +654,12 @@ async function endpoints() {
     // exactly ONE cut frame is dropped, whatever its duration, by Sandy's three promises (2026-11-03): no complete frame
     // is ever dropped, no byte of the cut frame survives, at most one frame is trimmed. At 8 kHz a frame is 72 ms, at
     // 44.1 kHz 26 ms. A LATER COMPLETE FRAME inside the cut frame's remains refuses the file (415 mp3-structure, at its
-    // header): a header of the stream whose frame fits before the audio's end, confirmed by what follows it (the end,
-    // zero bytes only, or another header's start). Astra's VBR case is one: a whole 32 kbps frame inside a cut 320 kbps
-    // one. A header nothing confirms (by chance in the audio, or a cut frame's start running past the end) is the cut
-    // frame's own bytes as far as anything can tell: dropped with it, still less than one frame's length
+    // header): a header of the file's layer (Layer III, any version, rate, bitrate or channel mode) whose frame fits
+    // before the audio's end, confirmed by what follows it after any zero bytes (the end, a frame of any stream, any
+    // tag, or the start of either). Astra's VBR case is one: a whole 32 kbps frame inside a cut 320 kbps one; her two
+    // on 8e107aec are others (a tag after it; free-format frames, refused wherever they start). A header nothing
+    // confirms (by chance in the audio, or a cut frame's start running past the end) is the cut frame's own bytes as
+    // far as anything can tell: dropped with it, still less than one frame's length
     const pktsOf = async (f) => (await sh('ffprobe', ['-v', 'error', '-select_streams', 'a', '-show_entries', 'packet=pos,size', '-of', 'csv=p=0', f])).trim().split('\n')
       .map((l) => { const [size, pos] = l.split(',').filter(Boolean).map(Number); return { pos, size }; });
     const countOf = async (f) => Number((await sh('ffprobe', ['-v', 'error', '-select_streams', 'a', '-count_packets', '-show_entries', 'stream=nb_read_packets', '-of', 'csv=p=0', f])).trim());
@@ -665,7 +668,7 @@ async function endpoints() {
       const f = await writeTmp(bytes, '.mp3'), o = `${f}.frames`;
       try { const r = await mp3Frames.sanitizeMp3(f, o); return { frames: r.frames, cutFrame: r.removed.cutFrame, out: await readFile(o) }; } catch (e) { return { code: `${e.workerCode} ${JSON.stringify(e.workerDetail)}` }; } finally { await rm(f, { force: true }); await rm(o, { force: true }); }
     };
-    for (const [rate, hi, lo, keep, ms, otherRate] of [[8000, '64k', '8k', 200, 72, 12000], [44100, '320k', '32k', 300, 26, 48000]]) {
+    for (const [rate, hi, lo, keep, ms, otherRate] of [[8000, '64k', '8k', 200, 72, 12000], [44100, '320k', '32k', 250, 26, 48000]]) {
       const enc = async (br, r = rate) => { const f = path.join(tmp, `vbr-${r}-${br}.mp3`); await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', `sine=frequency=440:duration=2:sample_rate=${r}`, '-ar', String(r), '-ac', '1', '-c:a', 'libmp3lame', '-b:a', br, '-write_xing', '0', '-id3v2_version', '0', '-write_id3v1', '0', f]); return f; };
       const hiF = await enc(hi), loF = await enc(lo);
       const hb = await readFile(hiF), hp = await pktsOf(hiF), lp = await pktsOf(loF);
@@ -714,47 +717,152 @@ async function endpoints() {
       // header's first byte): refused, promise 1. Its control: the same with a 0x55 byte instead, nothing confirming it: trimmed
       await refused(`its last ${hi} frame cut, a whole ${lo} frame, then one 0xFF byte ending the audio`, Buffer.concat([cut, loFrame, Buffer.from([0xff])]), cut.length);
       await trimmed(`a whole ${lo} frame inside that cut frame, then one 0x55 byte ending the audio (the 0xFF case's control: nothing confirms it)`, Buffer.concat([cut, loFrame, Buffer.from([0x55])]));
-      // ...and a whole frame of ANOTHER stream (${otherRate} Hz) inside the cut frame, to the end: not a frame of this
-      // stream, so the cut frame's own bytes: trimmed. Its control: a whole frame of this stream there (Astra's case,
-      // refused above)
+      // ...and a whole frame of ANOTHER stream (${otherRate} Hz, still Layer III) inside the cut frame, to the end: a
+      // complete frame all the same (Astra's class on 8e107aec: any version, rate, bitrate or channel mode), refused
       const otherF = await enc('32k', otherRate), op = await pktsOf(otherF);
       const otherFrame = (await readFile(otherF)).subarray(op[1].pos, op[1].pos + op[1].size);
       const otherStream = mp3Frames.frameAt(otherFrame).stream !== mp3Frames.frameAt(hb.subarray(last.pos)).stream && keep + otherFrame.length < last.size;
       check(`${rate} Hz, the ${otherRate} Hz frame is another stream and fits inside the cut ${hi} frame (so the next check proves something)`, otherStream);
-      await trimmed(`a whole ${otherRate} Hz frame (another stream, ${otherFrame.length} bytes) inside that cut frame, to the end`, Buffer.concat([cut, otherFrame]));
+      await refused(`its last ${hi} frame cut, a whole ${otherRate} Hz frame (another stream, ${otherFrame.length} bytes) after it to the end`, Buffer.concat([cut, otherFrame]), cut.length);
+      // Astra's P2s on 8e107aec, (1): a whole frame, then a tag that real tools write with no footer (so nothing reads it
+      // back from the end): the tag confirms the frame. ID3 v2.2, v2.3 and v2.4 without its footer; and after zero bytes
+      const v24 = (text) => { const body = Buffer.concat([Buffer.from('TIT2', 'latin1'), syncsafe4(text.length + 1), Buffer.from([0, 0, 3]), Buffer.from(text, 'latin1')]); return Buffer.concat([Buffer.from('ID3\x04\x00\x00', 'latin1'), syncsafe4(body.length), body]); };
+      for (const [v, make] of [['v2.2', id3['v2.2']], ['v2.3', id3['v2.3']], ['v2.4 (no footer)', v24]]) {
+        await refused(`its last ${hi} frame cut, a whole ${lo} frame, then an ID3 ${v} tag`, Buffer.concat([cut, loFrame, make('x')]), cut.length);
+      }
+      await refused(`its last ${hi} frame cut, a whole ${lo} frame, 20 zero bytes, then an ID3 v2.3 tag`, Buffer.concat([cut, loFrame, Buffer.alloc(20), id3['v2.3']('x')]), cut.length);
+      await refused(`its last ${hi} frame cut, a whole ${lo} frame, then the first 2 bytes of an ID3 header ending the audio`, Buffer.concat([cut, loFrame, Buffer.from('ID', 'latin1')]), cut.length);
+      // (2): free-format frames (bitrate index 0: no length in the header to confirm one by): refused wherever one
+      // starts. Two of them, as LAME writes them: the ${lo} frame with its bitrate index set to 0
+      const free = Buffer.from(loFrame); free[2] &= 0x0f;
+      await refused(`its last ${hi} frame cut, then two free-format frames`, Buffer.concat([cut, free, free]), cut.length);
+      // the boundary: a Layer II frame (MP2, another codec) isn't looked for: inside the cut frame it is dropped with it.
+      // But after a whole Layer III frame it confirms that one (a frame of any stream does)
+      const l2h = Buffer.from(loFrame.subarray(0, 4)); l2h[1] = (l2h[1] & 0xf9) | 0x04;
+      const layer2 = Buffer.concat([l2h, Buffer.alloc(mp3Frames.frameAt(l2h).len - 4, 0x55)]);
+      check(`${rate} Hz, the crafted Layer II frame is one (${layer2.length} bytes) and fits inside the cut ${hi} frame after a whole ${lo} one`, mp3Frames.frameAt(l2h).stream.split('.')[1] === '2' && keep + loFrame.length + layer2.length < last.size);
+      await trimmed(`a whole Layer II frame (${layer2.length} bytes, not looked for) inside that cut frame, to the end`, Buffer.concat([cut, layer2]));
+      await refused(`its last ${hi} frame cut, a whole ${lo} frame, then a whole Layer II frame`, Buffer.concat([cut, loFrame, layer2]), cut.length);
+      // the measured cost of refusing free-format outright: quiet and tonal frames' 0xFF filler holds free-format headers
+      // by chance (FF F3 03 at the end of a run, here). This sine's last frame holds one: cut past it, the file is
+      // refused, at it. Found by the test's own reading of the bytes (Layer III sync and layer bits, bitrate index 0)
+      const ffIII = (b, i) => b[i] === 0xff && (b[i + 1] & 0xe6) === 0xe2 && ((b[i + 1] >> 3) & 3) !== 1 && b[i + 2] >> 4 === 0 && ((b[i + 2] >> 2) & 3) !== 3 && (b[i + 3] & 3) !== 2;
+      let ffq = -1;
+      for (let q = 1; q + 4 <= last.size && ffq < 0; q++) if (ffIII(hb, last.pos + q)) ffq = q;
+      if (rate === 44100) {
+        check(`${rate} Hz, the sine's last frame holds a chance free-format header (at ${ffq}), past the positive control's ${keep} bytes`, ffq > keep);
+        await refused(`its last ${hi} frame cut to ${ffq + 20} bytes, past a chance free-format header in it`, hb.subarray(0, last.pos + ffq + 20), last.pos + ffq);
+      } else check(`${rate} Hz, the sine's last frame holds no free-format header before the positive control's ${keep} bytes`, ffq < 0 || ffq + 4 > keep, `at ${ffq}`);
     }
     // fade-to-silence endings (the Reviewer, 2026-11-03): quiet frames' filler holds headers of the stream by chance
     // (two corpus encodes refused 3.8% and 5.9% of their honest cuts by the rule before this one). Tone bursts fading into
-    // digital silence, 44.1 kHz stereo 320 kbps; 300 seeded cuts in the last 40% of its frames. Every one trimmed: the
-    // rebuild byte-equal to the whole frames before the cut one. The chance headers met are counted (at least one, or
-    // this proves nothing); three of those cuts through the endpoint too
+    // digital silence, 44.1 kHz stereo 320 kbps; 300 seeded cuts in the last 40% of its frames. Every one trimmed (the
+    // rebuild byte-equal to the whole frames before the cut one), except where the cut frame's remains hold a chance
+    // free-format header (the price of refusing free-format outright, Astra's P2 on 8e107aec): refused, at it. Which is
+    // which is the test's own reading of the bytes. Both are counted (at least one chance header of the layer, or this
+    // proves nothing); three of the trimmed cuts with a chance header through the endpoint too
     {
       const f = path.join(tmp, 'fade.mp3');
       await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'aevalsrc=exprs=if(lt(mod(t\\,5)\\,2)\\,0.4*sin(2*PI*460*t)*min(1\\,min(mod(t\\,5)\\,2-mod(t\\,5))*2)\\,0):s=44100:d=30', '-ac', '2', '-c:a', 'libmp3lame', '-b:a', '320k', '-write_xing', '0', '-id3v2_version', '0', '-write_id3v1', '0', f]);
       const b = await readFile(f), pk = await pktsOf(f);
       let seed = 53;
       const rnd = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32);
-      let wrong = [], chanceMet = 0;
+      let wrong = [], chanceMet = 0, freeMet = 0;
       const withChance = [];
+      const ffIII = (b, i) => b[i] === 0xff && (b[i + 1] & 0xe6) === 0xe2 && ((b[i + 1] >> 3) & 3) !== 1 && b[i + 2] >> 4 === 0 && ((b[i + 2] >> 2) & 3) !== 3 && (b[i + 3] & 3) !== 2;
       for (let k = 0; k < 300; k++) {
         const i = Math.floor(pk.length * 0.6) + Math.floor(rnd() * (pk.length * 0.4 - 1));
         const { pos, size } = pk[i];
         const x = pos + 1 + Math.floor(rnd() * (size - 1));
         const rest = b.subarray(pos, x);
-        let met = false;
-        for (let q = 1; q + 4 <= rest.length && !met; q++) if (rest[q] === 0xff && mp3Frames.frameAt(rest.subarray(q, q + 4))?.stream === mp3Frames.frameAt(b).stream) met = true;
-        if (met) { chanceMet++; if (withChance.length < 3) withChance.push([i, x]); }
+        let met = false, ff = -1;
+        for (let q = 1; q + 4 <= rest.length && !met; q++) if (rest[q] === 0xff && mp3Frames.frameAt(rest.subarray(q, q + 4))?.stream.split('.')[1] === '3') met = true;
+        for (let q = 1; q + 4 <= rest.length && ff < 0; q++) if (ffIII(rest, q)) ff = q;
+        if (met) chanceMet++;
+        if (ff >= 0) freeMet++;
+        else if (met && withChance.length < 3) withChance.push([i, x]);
         const r = await rebuild(b.subarray(0, x));
-        if (!(r.out?.equals(b.subarray(0, pos)) && r.frames === i && r.cutFrame === 1)) wrong.push(`${i}@${x}: ${r.code ?? r.frames}`);
+        const right = ff >= 0 ? r.code === `mp3-structure {"at":${pos + ff}}` : r.out?.equals(b.subarray(0, pos)) && r.frames === i && r.cutFrame === 1;
+        if (!right) wrong.push(`${i}@${x}: ${r.code ?? r.frames}${ff >= 0 ? ` (free-format at ${pos + ff})` : ''}`);
       }
-      check(`fade to silence: 300 cuts, ${chanceMet} of them with a chance header of the stream inside the cut frame: every one trimmed, exactly one frame, the rebuild byte-equal to the whole frames before it`,
-        wrong.length === 0 && chanceMet >= 1, wrong.slice(0, 4).join(' | '));
+      check(`fade to silence: 300 cuts, ${chanceMet} of them with a chance Layer III header inside the cut frame, ${freeMet} with a chance free-format one: those ${freeMet} refused at it, the other ${300 - freeMet} trimmed, exactly one frame, the rebuild byte-equal to the whole frames before it`,
+        wrong.length === 0 && chanceMet >= 1 && withChance.length >= 1, wrong.slice(0, 4).join(' | '));
       for (const [i, x] of withChance) {
         const c = await call('/strip-metadata', b.subarray(0, x));
         const out = c.uploaded && await writeTmp(c.uploaded, '.mp3');
         check(`...through the endpoint, cut inside frame ${i} (a chance header in it): 200, exactly ${i} packets`, c.r.statusCode === 200 && exact(c.json) && (await countOf(out)) === i, `${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
         if (out) await rm(out, { force: true });
       }
+    }
+    // generated tails (Astra's P2s on 8e107aec, the class): a stream's whole frames, then its cut last frame, then 0 to 3
+    // COMPLETE Layer III frames of mixed versions (MPEG 1, 2, 2.5), rates, bitrates (free-format among them), channel
+    // modes, padding and CRC, then optional zero bytes, then optional tags of every kind in a random order (ID3 v2.2,
+    // v2.3, v2.4 with and without its footer, ID3v1, APE with and without its header, Lyrics3 v2, Lyrics3 v1 and its
+    // ID3v1). All of it inside the cut frame's own length, so the audio ends inside it. Frames are built here, by the
+    // test's own tables; their bodies are bytes 0x80–0xFE (no 0xFF, no zero byte, no tag's letters), so the only 0xFF
+    // bytes are frame headers. Promise 1: with a complete frame there, refused at the first one (mp3-structure). Promise
+    // 2: with none, the rebuild byte-equal to the whole frames before the cut one (no byte of it, or of what followed,
+    // kept). Every kind of tag, every version and free-format each turn up in enough tails, or this proves nothing
+    {
+      // (mulberry32, seeded: the LCG above draws too correlated a mix for this many choices per tail)
+      let seed = 4;
+      const rnd = () => { let x = (seed = (seed + 0x6d2b79f5) >>> 0); x = Math.imul(x ^ (x >>> 15), x | 1); x ^= x + Math.imul(x ^ (x >>> 7), x | 61); return ((x ^ (x >>> 14)) >>> 0) / 2 ** 32; };
+      const pick = (a) => a[Math.floor(rnd() * a.length)];
+      const L3 = { 3: [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320], 2: [8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160] };
+      const HZ = { 3: [44100, 48000, 32000], 2: [22050, 24000, 16000], 0: [11025, 12000, 8000] };
+      // a Layer III frame: version bits (3 MPEG 1, 2 MPEG 2, 0 MPEG 2.5), rate index, bitrate index (0 free-format, `len` given)
+      const frame = ({ ver, sri, bri, pad = 0, crc = false, mode = 0, len }) => {
+        const n = bri ? Math.floor(((ver === 3 ? 144 : 72) * L3[ver === 3 ? 3 : 2][bri - 1] * 1000) / HZ[ver][sri]) + pad : len;
+        const f = Buffer.alloc(n);
+        Buffer.from([0xff, 0xe0 | (ver << 3) | 0x02 | (crc ? 0 : 1), (bri << 4) | (sri << 2) | (pad << 1), mode << 6]).copy(f);
+        for (let i = 4; i < n; i++) f[i] = 0x80 + Math.floor(rnd() * 0x7f);
+        return f;
+      };
+      const v24 = (text) => { const body = Buffer.concat([Buffer.from('TIT2', 'latin1'), syncsafe4(text.length + 1), Buffer.from([0, 0, 3]), Buffer.from(text, 'latin1')]); return Buffer.concat([Buffer.from('ID3\x04\x00\x00', 'latin1'), syncsafe4(body.length), body]); };
+      const TAGS = {
+        'ID3 v2.2': () => id3['v2.2']('Lagos'), 'ID3 v2.3': () => id3['v2.3']('Lagos'), 'ID3 v2.4': () => v24('Lagos'), 'ID3 v2.4 with a footer': () => id3['v2.4 with a footer']('Lagos'),
+        ID3v1: () => v1('Lagos'), 'APE (footer only)': () => ape('Lagos'), 'APE with its header': () => apeWithHeader('Lagos'), 'Lyrics3 v2': () => lyrics2('Lagos'),
+        'Lyrics3 v1 and its ID3v1': () => Buffer.concat([Buffer.from('LYRICSBEGINLagosLYRICSEND', 'latin1'), v1('Lagos')]),
+      };
+      // the stream: MPEG 1 at 32 kHz, MPEG 2 at 16 kHz, MPEG 2.5 at 8 kHz; its cut frame at 320 / 160 kbps (1440, 720, 1440 bytes)
+      const bases = [{ ver: 3, sri: 2, bri: 14 }, { ver: 2, sri: 2, bri: 14 }, { ver: 0, sri: 2, bri: 14 }];
+      const seen = { trimmed: 0, refused: 0, free: 0, versions: new Set(), tags: Object.fromEntries(Object.keys(TAGS).map((k) => [k, 0])), zeros: 0 };
+      const wrong = [];
+      for (let t = 0; t < 900; t++) {
+        const base = bases[t % 3];
+        const whole = Buffer.concat(Array.from({ length: 4 }, () => frame({ ver: base.ver, sri: base.sri, bri: 1 + Math.floor(rnd() * 14), pad: rnd() < 0.5 ? 1 : 0, mode: Math.floor(rnd() * 4) })));
+        const cutFrame = frame({ ...base, mode: Math.floor(rnd() * 4) });
+        const tags = Object.keys(TAGS).filter(() => rnd() < 0.25).sort(() => rnd() - 0.5);
+        const tagBytes = Buffer.concat(tags.map((k) => TAGS[k]()));
+        const zeros = Buffer.alloc(rnd() < 0.3 ? 1 + Math.floor(rnd() * 24) : 0);
+        let room = cutFrame.length - 1 - tagBytes.length - zeros.length; // what the tail may take, the audio ending inside the cut frame
+        const k = Math.floor(rnd() * Math.min(300, Math.max(0, room - 4)));
+        room -= 4 + k;
+        const complete = [];
+        for (let want = Math.floor(rnd() * 4), tries = 0; complete.length < want && tries < 40; tries++) {
+          const ver = pick([3, 2, 0]), free = rnd() < 0.2;
+          const f = frame({ ver, sri: Math.floor(rnd() * 3), bri: free ? 0 : 1 + Math.floor(rnd() * 14), pad: rnd() < 0.5 ? 1 : 0, crc: rnd() < 0.3, mode: Math.floor(rnd() * 4), len: 40 + Math.floor(rnd() * 160) });
+          if (f.length <= room) { complete.push({ f, ver, free }); room -= f.length; }
+        }
+        if (room < 0) continue;
+        const cutAt = whole.length, firstAt = cutAt + 4 + k;
+        const bytes = Buffer.concat([whole, cutFrame.subarray(0, 4 + k), ...complete.map((c) => c.f), zeros, tagBytes]);
+        const r = await rebuild(bytes);
+        if (complete.length) {
+          seen.refused++;
+          if (complete[0].free) seen.free++;
+          complete.forEach((c) => seen.versions.add(c.ver));
+          if (r.code !== `mp3-structure {"at":${firstAt}}`) wrong.push(`#${t} ${complete.length} complete (first ${complete[0].free ? 'free-format' : 'measured'}) at ${firstAt}: ${r.code ?? `trimmed, ${r.frames} frames`}`);
+        } else {
+          seen.trimmed++;
+          if (!(r.out?.equals(whole) && r.frames === 4 && r.cutFrame === 1)) wrong.push(`#${t} no complete frame: ${r.code ?? `${r.frames} frames, ${r.out?.length} bytes`}`);
+        }
+        tags.forEach((k2) => seen.tags[k2]++);
+        if (zeros.length) seen.zeros++;
+      }
+      const enough = seen.trimmed >= 100 && seen.refused >= 300 && seen.free >= 30 && seen.versions.size === 3 && seen.zeros >= 100 && Object.values(seen.tags).every((n) => n >= 100);
+      check(`generated tails, ${seen.trimmed + seen.refused}: ${seen.refused} with 1–3 complete frames after the cut one (${seen.free} free-format first; MPEG ${[...seen.versions].map((v) => ({ 3: '1', 2: '2', 0: '2.5' })[v]).join(', ')}), each refused at the first; ${seen.trimmed} with none, each trimmed byte-equal to the whole frames before it. Tags per kind: ${Object.entries(seen.tags).map(([k2, n]) => `${k2} ${n}`).join(', ')}; zero bytes in ${seen.zeros}`,
+        wrong.length === 0 && enough, `${wrong.length} wrong: ${wrong.slice(0, 4).join(' | ')}${enough ? '' : ' (and too few of some kind)'}`);
     }
     // near misses from real audio (Sandy's 94-minute set, 2026-11-01, refused at byte 45,522,714 by this check's
     // first version): quiet frames are mostly zero bytes, so a chance "ID3" there reads as a well-formed EMPTY tag.
