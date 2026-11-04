@@ -571,18 +571,24 @@ async function endpoints() {
       // cut at the field's 30 bytes mid-character, and a Cyrillic one. Inside a middle frame: refused by the input
       // rebuild through both endpoints, and named by the output walk on its own (given the bytes, and with the
       // rebuild sabotaged). After the audio (the positive control): removed, 200, none of its text kept
-      for (const [lang, title, artist] of [['Japanese', 'A東京の夜明けとフィクスチャー村の記録', 'テスト歌手'], ['Cyrillic', 'Фикстурвиль: запись у реки', 'Тестовый Артист']]) {
-        const tf = path.join(tmp, `v1-${lang}-${who}.mp3`);
-        await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'sine=d=1', '-metadata', `title=${title}`, '-metadata', `artist=${artist}`, '-c:a', 'libmp3lame', '-write_id3v1', '1', tf]);
+      // (and, the Reviewer's gap on 6dc4e5c2: an ID3v1.1 tag, its track number in byte 126, as ffmpeg writes it with a
+      // track: the v1.1 comment path)
+      for (const [lang, title, artist, more, shape] of [
+        ['Japanese', 'A東京の夜明けとフィクスチャー村の記録', 'テスト歌手', [], (t) => t[31] === 0xe3 && t[32] === 0x82], // cut mid-character
+        ['Cyrillic', 'Фикстурвиль: запись у реки', 'Тестовый Артист', [], () => true],
+        ['v1.1 (track 5, a comment)', 'Fixtureville', 'Test Artist', ['-metadata', 'track=5', '-metadata', 'comment=Fixtureville notes'], (t) => t[125] === 0 && t[126] === 5 && t.includes(Buffer.from('Fixtureville notes'))],
+      ]) {
+        const tf = path.join(tmp, `v1-${lang.replace(/\W+/g, '')}-${who}.mp3`);
+        await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'sine=d=1', '-metadata', `title=${title}`, '-metadata', `artist=${artist}`, ...more, '-c:a', 'libmp3lame', '-write_id3v1', '1', tf]);
         const t = (await readFile(tf)).subarray(-128);
         const text = Buffer.from(artist, 'utf8');
-        const madeByFfmpeg = t.subarray(0, 3).toString('latin1') === 'TAG' && t.includes(text) && (lang !== 'Japanese' || (t[31] === 0xe3 && t[32] === 0x82)); // cut mid-character
+        const madeByFfmpeg = t.subarray(0, 3).toString('latin1') === 'TAG' && t.includes(text) && shape(t);
         const bytes = Buffer.from(pb);
         const where = mid.pos + mid.size - 128;
         t.copy(bytes, where);
         const dirsBefore = (await jobDirs()).length;
         const c = await call('/strip-metadata', bytes);
-        check(`a ${lang} ID3v1 written by ffmpeg (UTF-8) inside a middle frame, ${who} → REFUSED 415 {error: mp3-tag-in-audio, detail: {at: ${where}}}, nothing written`,
+        check(`a ${lang} ID3v1 written by ffmpeg inside a middle frame, ${who} → REFUSED 415 {error: mp3-tag-in-audio, detail: {at: ${where}}}, nothing written`,
           madeByFfmpeg && c.r.statusCode === 415 && JSON.stringify(c.json) === JSON.stringify({ error: 'mp3-tag-in-audio', detail: { at: where } }) && c.uploaded === null && (await jobDirs()).length === dirsBefore,
           `made=${madeByFfmpeg} ${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
         const e = await enhanceRefuses(bytes, { error: 'mp3-tag-in-audio', detail: { at: where } });
@@ -766,6 +772,9 @@ async function endpoints() {
         ['TAG, a title with a lone UTF-8 continuation byte (A, 0x80)', pad(Buffer.from('TAGA\x80', 'latin1'))],
         ['TAG, a title with an encoded surrogate (ED A0 80, not UTF-8)', pad(Buffer.from('544147eda080', 'hex'))],
         ['TAG, a title with UTF-8 for a C1 control (C2 85)', pad(Buffer.from('544147c285', 'hex'))],
+        ['TAG, a title with a 3-byte overlong (E0 82 A0, U+00A0 written long: not UTF-8; 0x82 isn\'t Latin-1)', pad(Buffer.from('544147e082a0', 'hex'))],
+        ['TAG, a title with a lead byte then a non-continuation byte (E3 41 42), and ぁ (E3 81 81, so not Latin-1)', pad(Buffer.from('544147e34142e38181', 'hex'))],
+        ['TAG, a v1.1 comment that isn\'t text (0x01 in it), a NUL and track 5', pad(Buffer.concat([Buffer.from('TAGFixtureville', 'latin1'), Buffer.alloc(82), Buffer.from('notes\x01', 'latin1'), Buffer.alloc(22), Buffer.from([0, 5])]))],
         ['ID3 v2.3 of size 0, then zeros', pad(Buffer.from('ID3\x03\x00\x00\x00\x00\x00\x00', 'latin1'))],
         ['ID3 v2.4 whose body is zeros (padding only)', pad(Buffer.concat([Buffer.from('ID3\x04\x00\x00', 'latin1'), Buffer.from([0, 0, 0, 60])]))],
       ];
@@ -778,6 +787,9 @@ async function endpoints() {
         ['TAG with a non-ASCII Latin-1 title ("Café Ñandú")', pad(Buffer.from('TAGCafé Ñandú', 'latin1')), 'id3v1'],
         ['TAG with a UTF-8 title ("東京", "Москва"), a C1-range continuation byte in it', pad(Buffer.concat([Buffer.from('TAG', 'latin1'), Buffer.from('東京 Москва', 'utf8')])), 'id3v1'],
         ['TAG with a UTF-8 title cut mid-character by a NUL', pad(Buffer.concat([Buffer.from('TAG', 'latin1'), Buffer.from('東京', 'utf8').subarray(0, 5)])), 'id3v1'],
+        ['TAG with a title E0 A0 80 (U+0800, the smallest 3-byte character: the overlong near miss\'s partner)', pad(Buffer.from('544147e0a080', 'hex')), 'id3v1'],
+        ['TAG with a title E3 81 82 E3 81 81 (あぁ: the bad-continuation near miss\'s partner)', pad(Buffer.from('544147e38182e38181', 'hex')), 'id3v1'],
+        ['TAG v1.1, a text comment, a NUL and track 5 (the non-text comment\'s partner)', pad(Buffer.concat([Buffer.from('TAGFixtureville', 'latin1'), Buffer.alloc(82), Buffer.from('notes', 'latin1'), Buffer.alloc(23), Buffer.from([0, 5])])), 'id3v1'],
         ['TAG with every text field empty (her refinement, measured and not kept)', pad(Buffer.from('TAG', 'latin1')), 'id3v1'],
         ['TAG with a shortened title (its text, a NUL, the old text\'s tail)', pad(Buffer.from('TAGLagos\x00Fixtureville', 'latin1')), 'id3v1'],
         ['TAG with a title of 8 letters and digits ("Track 123")', pad(Buffer.from('TAGTrack 123', 'latin1')), 'id3v1'],
