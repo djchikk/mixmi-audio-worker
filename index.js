@@ -49,6 +49,15 @@ function clientErrorHandler(err, socket) {
   else socket.destroy();
 }
 
+// A preflight names its origin and the method it asks for. Without them, @fastify/cors replies "400 Invalid Preflight
+// Request" in plain text, outside the worker's codes (Astra's P3 on #4): refused here first, as bad-request. (Added
+// before the plugin is registered, so it runs before the plugin's own hook.)
+app.addHook('onRequest', async (request, reply) => {
+  if (request.method !== 'OPTIONS' || (request.headers.origin && request.headers['access-control-request-method'])) return;
+  app.log.info({ route: routeOf(request.url), status: 400, error: 'bad-request' }, 'Request refused');
+  return reply.status(400).send({ error: 'bad-request' });
+});
+
 // Enable CORS for mixmi frontend
 app.register(cors, {
   origin: [

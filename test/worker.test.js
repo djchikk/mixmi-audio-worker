@@ -1486,6 +1486,16 @@ async function endpoints() {
   }
   const health = await app.inject({ method: 'GET', url: '/health' });
   check('GET /health stays open (static status, no work)', health.statusCode === 200);
+  // CORS preflight (Astra's P3 on #4): a malformed one (no Origin, or no Access-Control-Request-Method) got
+  // @fastify/cors's plain-text "400 Invalid Preflight Request", outside the codes. Now exactly 400 {error: bad-request};
+  // the positive control, a real preflight from mixmi's origin, is still 204 with its CORS headers and no body
+  const pre = (headers) => app.inject({ method: 'OPTIONS', url: '/strip-metadata', headers });
+  for (const [label, headers] of [['no headers', {}], ['an Origin but no Access-Control-Request-Method', { origin: 'https://mixmi.io' }], ['a method but no Origin', { 'access-control-request-method': 'POST' }]]) {
+    const r = await pre(headers);
+    check(`a malformed CORS preflight (${label}) → 400 {"error":"bad-request"} exactly, as JSON`, r.statusCode === 400 && r.body === '{"error":"bad-request"}' && /^application\/json/.test(r.headers['content-type']), `${r.statusCode} ${r.body.slice(0, 80)}`);
+  }
+  const good = await pre({ origin: 'https://mixmi.io', 'access-control-request-method': 'POST' });
+  check('positive control: a real preflight from https://mixmi.io → 204, its origin allowed, POST allowed, no body', good.statusCode === 204 && good.headers['access-control-allow-origin'] === 'https://mixmi.io' && /POST/.test(good.headers['access-control-allow-methods']) && good.body === '', `${good.statusCode} ${JSON.stringify(good.headers)}`);
   await app.close();
   await rm(tmp, { recursive: true, force: true });
 }
