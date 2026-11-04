@@ -644,37 +644,98 @@ async function endpoints() {
       check('the output walk: frames only → []; +1 zero byte → mp3-unparsed; last frame cut → mp3-short-frame; a v2.4 tag after → id3v2; a zero byte first → mp3-unparsed',
         JSON.stringify(got) === JSON.stringify(['[]', '["mp3-unparsed"]', '["mp3-short-frame"]', '["id3v2"]', '["mp3-unparsed"]']), JSON.stringify(got));
     }
-    // exactly ONE cut frame is dropped, whatever its duration (Astra's P2s on #4, 2026-11-03: the rule is one incomplete
-    // final frame, not a time; the safety is that its bytes are dropped). At 8 kHz a frame is 72 ms, at 44.1 kHz 26 ms.
-    // VBR's case: a cut high-bitrate frame with a whole low-bitrate frame inside its remains dropped both; now a header
-    // of the stream inside the remains refuses the file (415 mp3-structure, at that header). Positive control: the
-    // cut frame alone gives 200 and exactly one frame fewer, the rest's packets equal
+    // exactly ONE cut frame is dropped, whatever its duration, by Sandy's three promises (2026-11-03): no complete frame
+    // is ever dropped, no byte of the cut frame survives, at most one frame is trimmed. At 8 kHz a frame is 72 ms, at
+    // 44.1 kHz 26 ms. A LATER COMPLETE FRAME inside the cut frame's remains refuses the file (415 mp3-structure, at its
+    // header): a header of the stream whose frame fits before the audio's end, confirmed by what follows it (the end,
+    // zero bytes only, or another header's start). Astra's VBR case is one: a whole 32 kbps frame inside a cut 320 kbps
+    // one. A header nothing confirms (by chance in the audio, or a cut frame's start running past the end) is the cut
+    // frame's own bytes as far as anything can tell: dropped with it, still less than one frame's length
+    const pktsOf = async (f) => (await sh('ffprobe', ['-v', 'error', '-select_streams', 'a', '-show_entries', 'packet=pos,size', '-of', 'csv=p=0', f])).trim().split('\n')
+      .map((l) => { const [size, pos] = l.split(',').filter(Boolean).map(Number); return { pos, size }; });
+    const countOf = async (f) => Number((await sh('ffprobe', ['-v', 'error', '-select_streams', 'a', '-count_packets', '-show_entries', 'stream=nb_read_packets', '-of', 'csv=p=0', f])).trim());
+    // the input rebuild on bytes: { code } or { frames, cutFrame, out } (its output's bytes)
+    const rebuild = async (bytes) => {
+      const f = await writeTmp(bytes, '.mp3'), o = `${f}.frames`;
+      try { const r = await mp3Frames.sanitizeMp3(f, o); return { frames: r.frames, cutFrame: r.removed.cutFrame, out: await readFile(o) }; } catch (e) { return { code: `${e.workerCode} ${JSON.stringify(e.workerDetail)}` }; } finally { await rm(f, { force: true }); await rm(o, { force: true }); }
+    };
     for (const [rate, hi, lo, keep, ms] of [[8000, '64k', '8k', 200, 72], [44100, '320k', '32k', 300, 26]]) {
       const enc = async (br) => { const f = path.join(tmp, `vbr-${rate}-${br}.mp3`); await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', `sine=frequency=440:duration=2:sample_rate=${rate}`, '-ar', String(rate), '-ac', '1', '-c:a', 'libmp3lame', '-b:a', br, '-write_xing', '0', '-id3v2_version', '0', '-write_id3v1', '0', f]); return f; };
-      const pkts = async (f) => (await sh('ffprobe', ['-v', 'error', '-select_streams', 'a', '-show_entries', 'packet=pos,size', '-of', 'csv=p=0', f])).trim().split('\n')
-        .map((l) => { const [size, pos] = l.split(',').filter(Boolean).map(Number); return { pos, size }; });
       const hiF = await enc(hi), loF = await enc(lo);
-      const hb = await readFile(hiF), hp = await pkts(hiF), lp = await pkts(loF);
-      const last = hp[hp.length - 1];
+      const hb = await readFile(hiF), hp = await pktsOf(hiF), lp = await pktsOf(loF);
+      const last = hp[hp.length - 1], mid = hp[Math.floor(hp.length / 2)];
       const loFrame = (await readFile(loF)).subarray(lp[1].pos, lp[1].pos + lp[1].size);
+      const whole = hb.subarray(0, last.pos); // every frame but the last, byte for byte
       const cut = hb.subarray(0, last.pos + keep);
-      const sameStream = mp3Frames.frameAt(loFrame).stream === mp3Frames.frameAt(hb.subarray(last.pos)).stream && keep + loFrame.length < last.size;
+      const sameStream = mp3Frames.frameAt(loFrame).stream === mp3Frames.frameAt(hb.subarray(last.pos)).stream && keep + 2 * loFrame.length < last.size;
       const kept = path.join(tmp, `vbr-${rate}-kept.mp3`);
-      await writeFile(kept, hb.subarray(0, last.pos));
-      const count = async (f) => Number((await sh('ffprobe', ['-v', 'error', '-select_streams', 'a', '-count_packets', '-show_entries', 'stream=nb_read_packets', '-of', 'csv=p=0', f])).trim());
-      const one = await call('/strip-metadata', cut);
-      const out = one.uploaded && await writeTmp(one.uploaded, '.mp3');
-      check(`${rate} Hz, its last ${hi} frame (${ms} ms) cut to ${keep} bytes: 200, exactly one frame dropped (${hp.length} → ${hp.length - 1} packets), the rest's packets equal, clean frame to frame`,
-        one.r.statusCode === 200 && exact(one.json) && (await count(out)) === hp.length - 1 && (await packetHash(out)) === (await packetHash(kept)) && (await media.metadataReport(out, 'mp3')).clean,
-        `${one.r.statusCode} ${one.r.body.slice(0, 120)}`);
-      if (out) await rm(out, { force: true });
-      for (const [label, bytes] of [[`a whole ${lo} frame (${loFrame.length} bytes) inside its remains`, Buffer.concat([cut, loFrame])], [`a cut ${lo} frame inside its remains (a second incomplete frame)`, Buffer.concat([cut, loFrame.subarray(0, loFrame.length - 10)])], [`2 bytes of a ${lo} header ending its remains`, Buffer.concat([cut, loFrame.subarray(0, 2)])]]) {
+      await writeFile(kept, whole);
+      // trimmed: the rebuild's output byte-equal to the whole frames (N−1, the cut one dropped); through the endpoint
+      // 200, exactly N−1 packets, theirs equal, clean frame to frame
+      const trimmed = async (label, bytes) => {
+        const r = await rebuild(bytes);
+        const c = await call('/strip-metadata', bytes);
+        const out = c.uploaded && await writeTmp(c.uploaded, '.mp3');
+        check(`${rate} Hz, ${label}: trimmed, exactly one frame (${ms} ms): the rebuild byte-equal to the ${hp.length - 1} whole frames; 200, ${hp.length - 1} packets, equal, clean frame to frame`,
+          sameStream && r.out?.equals(whole) && r.frames === hp.length - 1 && r.cutFrame === 1
+            && c.r.statusCode === 200 && exact(c.json) && (await countOf(out)) === hp.length - 1 && (await packetHash(out)) === (await packetHash(kept)) && (await media.metadataReport(out, 'mp3')).clean,
+          `${JSON.stringify({ ...r, out: r.out?.length })} ${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
+        if (out) await rm(out, { force: true });
+      };
+      const refused = async (label, bytes, where) => {
         for (const ep of ['/strip-metadata', '/enhance']) {
+          const dirsBefore = (await jobDirs()).length;
           const c = await call(ep, bytes, ep === '/enhance' ? { body: { enhancementType: 'clean' } } : {});
-          check(`${rate} Hz, its last ${hi} frame cut, ${label}, ${ep} → REFUSED 415 {error: mp3-structure, detail: {at: ${cut.length}}}, nothing written`,
-            sameStream && c.r.statusCode === 415 && JSON.stringify(c.json) === JSON.stringify({ error: 'mp3-structure', detail: { at: cut.length } }) && c.uploaded === null,
+          check(`${rate} Hz, ${label}, ${ep} → REFUSED 415 {error: mp3-structure, detail: {at: ${where}}}, nothing written, no temp dir left`,
+            sameStream && c.r.statusCode === 415 && JSON.stringify(c.json) === JSON.stringify({ error: 'mp3-structure', detail: { at: where } }) && c.uploaded === null && (await jobDirs()).length === dirsBefore,
             `same=${sameStream} ${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
         }
+      };
+      // a chance header inside the cut frame: the remains with a header written into them, its frame fitting but
+      // followed by 0x55 filler (as quiet frames have), or running past the end
+      const chance = (at, header, fill) => { const b = Buffer.from(cut); header.copy(b, last.pos + at); if (fill !== undefined) b.fill(0x55, fill, fill + 4); return b; };
+      const loHeader = loFrame.subarray(0, 4), hiHeader = hb.subarray(last.pos, last.pos + 4);
+      await trimmed(`its last ${hi} frame cut to ${keep} bytes (the positive control)`, cut);
+      await trimmed(`a chance ${lo} header inside that cut frame, its frame fitting, then filler (nothing confirms it)`, chance(40, loHeader, last.pos + 40 + loFrame.length));
+      await trimmed(`a chance ${hi} header inside that cut frame, its frame running past the end`, chance(keep - 40, hiHeader));
+      await trimmed(`a cut ${lo} frame's start inside that cut frame (a cut A and a cut B start, dropped together: ${keep + loFrame.length - 10} bytes, under one ${hi} frame)`, Buffer.concat([cut, loFrame.subarray(0, loFrame.length - 10)]));
+      await trimmed(`2 bytes of a ${lo} header ending that cut frame`, Buffer.concat([cut, loFrame.subarray(0, 2)]));
+      await refused(`its last ${hi} frame cut, a whole ${lo} frame (${loFrame.length} bytes) after it to the end (Astra's VBR case)`, Buffer.concat([cut, loFrame]), cut.length);
+      await refused(`its last ${hi} frame cut, a whole ${lo} frame, then zero bytes to the end`, Buffer.concat([cut, loFrame, Buffer.alloc(20)]), cut.length);
+      await refused(`two cut frames: its last ${hi} frame cut, a whole ${lo} frame, then a cut one`, Buffer.concat([cut, loFrame, loFrame.subarray(0, loFrame.length - 10)]), cut.length);
+      await refused(`two cut frames: one in the middle (50 bytes short), and the last`, Buffer.concat([hb.subarray(0, mid.pos + mid.size - 50), hb.subarray(mid.pos + mid.size, last.pos + keep)]), mid.pos + mid.size);
+    }
+    // fade-to-silence endings (the Reviewer, 2026-11-03): quiet frames' filler holds headers of the stream by chance
+    // (two corpus encodes refused 3.8% and 5.9% of their honest cuts by the rule before this one). Tone bursts fading into
+    // digital silence, 44.1 kHz stereo 320 kbps; 300 seeded cuts in the last 40% of its frames. Every one trimmed: the
+    // rebuild byte-equal to the whole frames before the cut one. The chance headers met are counted (at least one, or
+    // this proves nothing); three of those cuts through the endpoint too
+    {
+      const f = path.join(tmp, 'fade.mp3');
+      await sh('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'aevalsrc=exprs=if(lt(mod(t\\,5)\\,2)\\,0.4*sin(2*PI*460*t)*min(1\\,min(mod(t\\,5)\\,2-mod(t\\,5))*2)\\,0):s=44100:d=30', '-ac', '2', '-c:a', 'libmp3lame', '-b:a', '320k', '-write_xing', '0', '-id3v2_version', '0', '-write_id3v1', '0', f]);
+      const b = await readFile(f), pk = await pktsOf(f);
+      let seed = 53;
+      const rnd = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32);
+      let wrong = [], chanceMet = 0;
+      const withChance = [];
+      for (let k = 0; k < 300; k++) {
+        const i = Math.floor(pk.length * 0.6) + Math.floor(rnd() * (pk.length * 0.4 - 1));
+        const { pos, size } = pk[i];
+        const x = pos + 1 + Math.floor(rnd() * (size - 1));
+        const rest = b.subarray(pos, x);
+        let met = false;
+        for (let q = 1; q + 4 <= rest.length && !met; q++) if (rest[q] === 0xff && mp3Frames.frameAt(rest.subarray(q, q + 4))?.stream === mp3Frames.frameAt(b).stream) met = true;
+        if (met) { chanceMet++; if (withChance.length < 3) withChance.push([i, x]); }
+        const r = await rebuild(b.subarray(0, x));
+        if (!(r.out?.equals(b.subarray(0, pos)) && r.frames === i && r.cutFrame === 1)) wrong.push(`${i}@${x}: ${r.code ?? r.frames}`);
+      }
+      check(`fade to silence: 300 cuts, ${chanceMet} of them with a chance header of the stream inside the cut frame: every one trimmed, exactly one frame, the rebuild byte-equal to the whole frames before it`,
+        wrong.length === 0 && chanceMet >= 1, wrong.slice(0, 4).join(' | '));
+      for (const [i, x] of withChance) {
+        const c = await call('/strip-metadata', b.subarray(0, x));
+        const out = c.uploaded && await writeTmp(c.uploaded, '.mp3');
+        check(`...through the endpoint, cut inside frame ${i} (a chance header in it): 200, exactly ${i} packets`, c.r.statusCode === 200 && exact(c.json) && (await countOf(out)) === i, `${c.r.statusCode} ${c.r.body.slice(0, 120)}`);
+        if (out) await rm(out, { force: true });
       }
     }
     // near misses from real audio (Sandy's 94-minute set, 2026-11-01, refused at byte 45,522,714 by this check's
