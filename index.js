@@ -5,17 +5,58 @@ const crypto = require('crypto');
 // Through the module object (not destructured): the endpoint tests swap a
 // step out to prove the output verification is what refuses a dirty file.
 const media = require('./lib/stripMedia');
-const { SECRET_HEADER, secretOk } = require('./lib/guards');
+const guards = require('./lib/guards');
+const { SECRET_HEADER } = guards;
 const io = require('./lib/storageIO');
 const sei = require('./lib/videoSei');
 const limits = require('./lib/limits');
 const proc = require('./lib/proc');
 const commands = require('./lib/commands');
 const inputs = require('./lib/inputs');
+const { tag, failure } = require('./lib/errors');
+const { loggerOptions, routeOf } = require('./lib/logging');
 
 // Use system FFmpeg (installed via apt in Dockerfile)
 
-const app = Fastify({ logger: true });
+// Its own lines and Fastify's go through ./lib/logging: no URL, no message text
+const app = Fastify({
+  logger: loggerOptions(),
+  // a malformed URL (Fastify's default reply quotes the path) or a failed async constraint: a code (Astra's P2 on #4)
+  frameworkErrors: (error, request, reply) => refuse(error, request, reply),
+  clientErrorHandler,
+});
+
+// Fastify's own errors (a body that isn't JSON, one too large, an unknown content
+// type, a hook that throws, a URL it can't decode…) leave as a code too: its
+// default handler replies with the error's message and logs it, and a JSON parse
+// error's message quotes the body (the Reviewer's P3 on #4, Astra's P2-3). A 4xx
+// is bad-request, anything else internal; logged as route, code and status.
+function refuse(error, request, reply) {
+  const { status, body } = failure(error, (e) => (e.statusCode >= 400 && e.statusCode < 500 ? 'bad-request' : null));
+  const line = { route: routeOf(request.url), status, ...body };
+  if (status < 500) app.log.info(line, 'Request refused');
+  else app.log.error(line, 'Request failed');
+  reply.status(status).send(body);
+}
+// ...and the HTTP parser's, before there is a request at all (a malformed request
+// line or header, headers too large, a timeout): Fastify's default reply is fixed
+// text, but it isn't one of the worker's codes, and it logs the error itself
+const CLIENT_ERROR = JSON.stringify({ error: 'bad-request' });
+function clientErrorHandler(err, socket) {
+  if (err.code === 'ECONNRESET' || socket.destroyed) return;
+  app.log.info({ route: 'unmatched', status: 400, error: 'bad-request' }, 'Request refused');
+  if (socket.writable) socket.end(`HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: ${CLIENT_ERROR.length}\r\nConnection: close\r\n\r\n${CLIENT_ERROR}`);
+  else socket.destroy();
+}
+
+// A preflight names its origin and the method it asks for. Without them, @fastify/cors replies "400 Invalid Preflight
+// Request" in plain text, outside the worker's codes (Astra's P3 on #4): refused here first, as bad-request. (Added
+// before the plugin is registered, so it runs before the plugin's own hook.)
+app.addHook('onRequest', async (request, reply) => {
+  if (request.method !== 'OPTIONS' || (request.headers.origin && request.headers['access-control-request-method'])) return;
+  app.log.info({ route: routeOf(request.url), status: 400, error: 'bad-request' }, 'Request refused');
+  return reply.status(400).send({ error: 'bad-request' });
+});
 
 // Enable CORS for mixmi frontend
 app.register(cors, {
@@ -37,8 +78,16 @@ app.addHook('onRequest', async (request, reply) => {
   const route = `${request.method} ${request.url.split('?')[0]}`;
   if (OPEN_ROUTES.has(route)) return;
   const secret = process.env.MEDIA_WORKER_SECRET;
-  if (!secret) return reply.status(503).send({ error: 'Worker not configured' });
-  if (!secretOk(request.headers[SECRET_HEADER], secret)) return reply.status(401).send({ error: 'Unauthorized' });
+  if (!secret) return reply.status(503).send({ error: 'not-configured' });
+  if (!guards.secretOk(request.headers[SECRET_HEADER], secret)) return reply.status(401).send({ error: 'unauthorized' });
+});
+
+app.setErrorHandler(refuse);
+// ...and a route the worker doesn't have: Fastify's default 404 echoes the method
+// and URL in its reply and its log
+app.setNotFoundHandler((request, reply) => {
+  app.log.info({ route: 'unmatched', status: 404, error: 'not-found' }, 'Route not found');
+  reply.status(404).send({ error: 'not-found' });
 });
 
 // FFmpeg filter chains for each enhancement type
@@ -87,9 +136,23 @@ app.get('/health', async () => {
 
 class UnsupportedError extends Error {}
 class VerificationError extends Error {}
+/** A refusal or failure with its code (lib/errors) and numbers. Its message stays inside the worker. */
+const unsupported = (code, detail) => tag(new UnsupportedError(code), code, detail);
+const unverified = (code, detail) => tag(new VerificationError(code), code, detail);
 
-/** Error text for logs and replies: never a URL (they carry tokens). */
-const scrub = (msg) => String(msg || 'failed').replace(/https?:\/\/\S+/g, '[url]').slice(0, 300);
+/** A code for an error not tagged where it was thrown, by its class (lib/errors: else `internal`). */
+function classify(e) {
+  if (e instanceof io.TooLargeError) return 'source-too-large';
+  if (e instanceof proc.OsLimitError) return 'os-limit';
+  if (e instanceof sei.SeiLimitError) return 'sei-expands';
+  if (e instanceof inputs.InputRefused) return 'input-refused';
+  if (e instanceof UnsupportedError) return 'unsupported-media';
+  if (e instanceof io.DeadlineError || e?.deadline) return 'deadline';
+  if (e instanceof io.ContractError) return 'bad-request';
+  if (e instanceof proc.ProcError) return 'ffmpeg-failed';
+  if (e instanceof VerificationError) return 'metadata-survived';
+  return null;
+}
 
 /** Run ffmpeg under the OS limits (lib/proc): `fsizeBytes` for any file it writes, CPU from the deadline, in the job's dir. */
 function runFfmpeg(args, { fsizeBytes, cwd, timeoutMs = FFMPEG_TIMEOUT_MS }) {
@@ -103,6 +166,12 @@ function runFfmpeg(args, { fsizeBytes, cwd, timeoutMs = FFMPEG_TIMEOUT_MS }) {
  * `work` turns it into an output file that has passed its own verification,
  * and the output is written back in place (deadline). Temp files: one temp dir,
  * removed in finally. Logs: jobId + bucket/key only.
+ *
+ * Before any `work` reads it, an MP3 is rebuilt from its audio frames alone
+ * (lib/mp3Frames): every tag, wherever it sits, dropped; a tag inside the
+ * frames, a cut-off frame or any byte that is neither a frame nor a tag refuses
+ * the file. Every endpoint reads the rebuilt file (Astra's P2 on #4: /enhance
+ * decoded the original).
  */
 function inPlaceEndpoint(name, work, validate = () => null) {
   return async (request, reply) => {
@@ -111,8 +180,8 @@ function inPlaceEndpoint(name, work, validate = () => null) {
     let ref;
     try {
       ({ ref } = io.inPlaceTarget(sourceUrl, uploadUrl));
-    } catch (e) {
-      return reply.status(400).send({ error: e.message });
+    } catch {
+      return reply.status(400).send({ error: 'bad-request' });
     }
     const invalid = validate(request.body || {});
     if (invalid) return reply.status(400).send({ error: invalid });
@@ -124,21 +193,26 @@ function inPlaceEndpoint(name, work, validate = () => null) {
         // the closed input rule (lib/inputs): an allowlisted container by its
         // magic bytes, or refused before ffmpeg ever runs (playlists, concat
         // lists, SDP and every other indirection format included)
-        if (!inputs.containerOfFile(input)) throw new inputs.InputRefused('Not an accepted media container');
-        const out = await work({ jobId, ref, dir, input, contentType: got.contentType, body: request.body || {} });
+        const container = inputs.containerOfFile(input);
+        if (!container) throw new inputs.InputRefused('Not an accepted media container');
+        let src = input, mp3 = null;
+        if (container === 'mp3') {
+          src = path.join(dir, 'in-frames');
+          mp3 = await media.sanitizeMp3(input, src);
+        }
+        const out = await work({ jobId, ref, dir, input: src, contentType: got.contentType, body: request.body || {} });
         const up = await io.uploadFile(uploadUrl, out.file, out.contentType, { deadlineMs: UPLOAD_DEADLINE_MS });
-        app.log.info({ jobId, ref, endpoint: name, bytes: up.bytes, ...out.log }, 'Written back in place');
+        app.log.info({ jobId, ref, endpoint: name, bytes: up.bytes, ...out.log, ...(mp3 && { mp3Frames: mp3.frames, mp3Removed: mp3.removed }) }, 'Written back in place');
       });
       // The ONE success shape, for every endpoint: exactly these three fields.
       // Every endpoint writes a verified metadata-free file, so stripped is
       // always true. (mixmi accepts nothing else as success.)
       return reply.send({ success: true, stripped: true, jobId });
     } catch (error) {
-      // an OS file-size limit (lib/proc), or the Annex-B budget, is a size refusal
-      const tooLarge = error instanceof io.TooLargeError || error instanceof proc.OsLimitError || error instanceof sei.SeiLimitError;
-      const status = tooLarge ? 413 : error instanceof UnsupportedError || error instanceof inputs.InputRefused ? 415 : error instanceof io.DeadlineError || error.deadline ? 504 : 500;
-      app.log.error({ jobId, ref, endpoint: name, error: scrub(error.message) }, 'Job failed');
-      return reply.status(status).send({ error: scrub(error.message) });
+      // a code and numbers only, in the reply AND the log (lib/errors): never the error's text
+      const { status, body } = failure(error, classify);
+      app.log.error({ jobId, ref, endpoint: name, status, ...body }, 'Job failed');
+      return reply.status(status).send(body);
     }
   };
 }
@@ -147,7 +221,7 @@ function inPlaceEndpoint(name, work, validate = () => null) {
 async function verifyClean(file, kind) {
   const report = await media.metadataReport(file, kind, PROBE_DEADLINE_MS);
   if (!report.clean) {
-    throw new VerificationError(`metadata survived (${report.leftovers.join(',') || '-'}, format tags ${report.formatTags}, stream tags ${report.streamTags}, other streams ${report.otherStreams})`);
+    throw unverified('metadata-survived', { leftovers: report.leftovers.length, formatTags: report.formatTags, streamTags: report.streamTags, otherStreams: report.otherStreams });
   }
 }
 
@@ -157,7 +231,7 @@ async function counted(fn) {
     return await fn();
   } catch (e) {
     if (e.deadline) throw new io.DeadlineError('measuring the media timed out');
-    if (e instanceof limits.LimitError) throw new UnsupportedError(`The media ${e.message}`);
+    if (e instanceof limits.LimitError) throw unsupported('undecodable');
     throw e;
   }
 }
@@ -165,8 +239,18 @@ async function counted(fn) {
 /** Refuse an input whose length, measured BOTH ways over every stream (lib/limits), is over the cap. */
 async function measureOrRefuse(input, { audioStreams, capSec, what, cwd }) {
   const m = await counted(() => limits.trueDuration(input, { audioStreams, capSec, timeoutMs: FFMPEG_TIMEOUT_MS, cwd }));
-  if (m.over) throw new io.TooLargeError(`${what} exceeds the ${capSec}s cap (measured: ${m.why.join(', ')})`);
+  if (m.over) throw tag(new io.TooLargeError(what), 'duration-over-cap', overDetail(m, capSec));
   return m;
+}
+/** What was over, as numbers: only the measures that were over the cap are given. */
+function overDetail(m, capSec) {
+  const d = { capSec };
+  const over = m.audioSec.findIndex((sec) => sec > capSec);
+  if (over >= 0) Object.assign(d, { audioSec: m.audioSec[over], stream: over + 1 });
+  if (m.videoFrames !== null && m.videoFrames > capSec * limits.MAX_FPS) d.frames = m.videoFrames;
+  if (m.spanSec > capSec) d.spanSec = m.spanSec;
+  if (m.stopped) d.packets = 1;
+  return d;
 }
 const audioCount = (probe) => (probe.streams || []).filter((s) => s.codec_type === 'audio').length;
 const MB = 1024 * 1024;
@@ -174,19 +258,19 @@ const MB = 1024 * 1024;
 /** An output that reached its byte cap was cut short by -fs: refused. */
 async function refuseIfCut(output, maxBytes, what) {
   const written = await io.fileSize(output);
-  if (written >= maxBytes) throw new io.TooLargeError(`${what} output exceeds the ${maxBytes}-byte cap (stopped at ${written} bytes)`);
+  if (written >= maxBytes) throw tag(new io.TooLargeError(what), 'output-over-cap', { capBytes: maxBytes, bytes: written });
 }
 
 /** Neutralize private SEI in place; refuse when it shares a NAL with picture-relevant SEI. */
 async function neutralizeSei(file, codec) {
   const r = await sei.neutralizeSeiInIso(file, codec);
-  if (r.refused) throw new UnsupportedError(`Video stream: ${r.refused} — refused`);
+  if (r.refused) throw unsupported('private-sei-refused');
 }
 
 /** The picture stream must carry no private SEI at all (an independent re-scan, parameter sets included). */
 async function verifySei(file, codec, dir) {
   const r = await sei.seiReport(file, codec, dir, PROBE_DEADLINE_MS * 2);
-  if (r && (r.private > 0 || r.refuseNals > 0)) throw new VerificationError(`private data survived in the video stream (${r.private} SEI messages)`);
+  if (r && (r.private > 0 || r.refuseNals > 0)) throw unverified('private-sei-survived', { private: r.private, refuseNals: r.refuseNals });
 }
 
 // Enhance: an audio file → enhanced WAV, written back in place. mixmi then
@@ -200,9 +284,9 @@ app.post('/enhance', inPlaceEndpoint('enhance', async ({ dir, input, body }) => 
     probe = await io.probeFile(input, PROBE_DEADLINE_MS);
   } catch (e) {
     if (e instanceof io.DeadlineError) throw e;
-    throw new UnsupportedError('Not audio ffmpeg can read');
+    throw unsupported('undecodable');
   }
-  if (!(probe.streams || []).some((st) => st.codec_type === 'audio')) throw new UnsupportedError('No audio stream');
+  if (!(probe.streams || []).some((st) => st.codec_type === 'audio')) throw unsupported('no-audio');
   // Length measured both ways over every stream (lib/limits) — never the
   // container's declared duration; bounded just past the cap.
   await measureOrRefuse(input, { audioStreams: audioCount(probe), capSec: caps.maxDurationSec, what: 'Input (enhancement)', cwd: dir });
@@ -212,10 +296,10 @@ app.post('/enhance', inPlaceEndpoint('enhance', async ({ dir, input, body }) => 
   // reaching either limit means the output was cut short — refused, never uploaded
   await refuseIfCut(output, caps.maxOutputBytes, 'Enhanced');
   const outSec = await counted(() => limits.audioSeconds(output, caps.maxDurationSec + 1, FFMPEG_TIMEOUT_MS, 0, dir));
-  if (outSec > caps.maxDurationSec) throw new io.TooLargeError(`Enhanced output reached the ${caps.maxDurationSec}s limit`);
+  if (outSec > caps.maxDurationSec) throw tag(new io.TooLargeError('enhanced'), 'output-over-cap', { capSec: caps.maxDurationSec, audioSec: outSec });
   await verifyClean(output, 'wav');
   return { file: output, contentType: 'audio/wav', log: { enhancementType } };
-}, (body) => (ENHANCEMENT_FILTERS[body.enhancementType || 'auto'] ? null : 'Invalid enhancementType')));
+}, (body) => (ENHANCEMENT_FILTERS[body.enhancementType || 'auto'] ? null : 'invalid-enhancement-type')));
 
 // Video transcode: webm (or anything ffmpeg reads) → iPhone-safe MP4, written
 // back in place. H.264 main profile + AAC, faststart, CFR 30, capped at 1280px
@@ -226,12 +310,12 @@ app.post('/transcode-video', inPlaceEndpoint('transcode', async ({ dir, input })
     probe = await io.probeFile(input, PROBE_DEADLINE_MS);
   } catch (e) {
     if (e instanceof io.DeadlineError) throw e;
-    throw new UnsupportedError('Not a video ffmpeg can read');
+    throw unsupported('undecodable');
   }
   const caps = transcodeCaps();
   const hasAudio = (probe.streams || []).some((s) => s.codec_type === 'audio');
   const hasVideo = (probe.streams || []).some((s) => s.codec_type === 'video' && !s.disposition?.attached_pic);
-  if (!hasVideo) throw new UnsupportedError('No video stream');
+  if (!hasVideo) throw unsupported('no-video');
   // Length measured both ways over every stream — MediaRecorder WebM (ordinary
   // browser output) has no container duration at all
   const m = await measureOrRefuse(input, { audioStreams: audioCount(probe), capSec: caps.maxDurationSec, what: 'Source', cwd: dir });
@@ -241,10 +325,10 @@ app.post('/transcode-video', inPlaceEndpoint('transcode', async ({ dir, input })
   // reaching any limit means the output was cut short — refused, never uploaded
   await refuseIfCut(output, caps.maxOutputBytes, 'Transcoded');
   const outFrames = (await counted(() => limits.packetCounts(output, ['-map', '0:v:0'], maxFrames, FFMPEG_TIMEOUT_MS, dir))).counts[0] || 0;
-  if (outFrames > caps.maxDurationSec * 30) throw new io.TooLargeError(`Transcoded output reached the ${caps.maxDurationSec}s limit (${outFrames} frames at 30 fps)`);
+  if (outFrames > caps.maxDurationSec * 30) throw tag(new io.TooLargeError('transcoded'), 'output-over-cap', { capSec: caps.maxDurationSec, frames: outFrames });
   if (hasAudio) {
     const outSec = await counted(() => limits.audioSeconds(output, caps.maxDurationSec + 1, FFMPEG_TIMEOUT_MS, 0, dir));
-    if (outSec > caps.maxDurationSec) throw new io.TooLargeError(`Transcoded output reached the ${caps.maxDurationSec}s limit (audio)`);
+    if (outSec > caps.maxDurationSec) throw tag(new io.TooLargeError('transcoded'), 'output-over-cap', { capSec: caps.maxDurationSec, audioSec: outSec });
   }
   await media.blankMetadataBoxes(output);
   await neutralizeSei(output, 'h264'); // x264's own settings message included
@@ -263,11 +347,11 @@ app.post('/transcode-video', inPlaceEndpoint('transcode', async ({ dir, input })
 app.post('/strip-metadata', inPlaceEndpoint('strip', async ({ dir, input, contentType }) => {
   // Container by content (probe), never by name or first box.
   const fmt = await media.mediaFormat(input, PROBE_DEADLINE_MS);
-  if (!fmt) throw new UnsupportedError('Not a media file this worker accepts');
+  if (!fmt) throw unsupported('unsupported-media');
   // Picture: an allowlisted codec, one track. (Clean it or refuse it: e.g.
   // Motion-JPEG frames can each carry EXIF, so other codecs are refused.)
-  if (fmt.video.some((c) => !media.VIDEO_CODECS.has(c))) throw new UnsupportedError(`Video codec not accepted: ${fmt.video.join(', ')}`);
-  if (fmt.video.length > 1) throw new UnsupportedError('More than one picture track');
+  if (fmt.video.some((c) => !media.VIDEO_CODECS.has(c))) throw unsupported('video-codec-refused');
+  if (fmt.video.length > 1) throw unsupported('video-tracks', { tracks: fmt.video.length });
   // H.264 / HEVC: private SEI (lib/videoSei) — neutralized in place after the
   // remux (MP4 / MOV), or the file refused
   const codec = fmt.video[0];
@@ -275,9 +359,9 @@ app.post('/strip-metadata', inPlaceEndpoint('strip', async ({ dir, input, conten
   if (avc && fmt.family !== 'iso') {
     // no in-place editing outside MP4 / MOV: private SEI there is refused
     const r = await sei.seiReport(input, codec, dir, PROBE_DEADLINE_MS * 2);
-    if (r.private) throw new UnsupportedError('Private data in the video stream of a non-MP4 container — refused');
+    if (r.private) throw unsupported('private-sei-refused');
   }
-  if (fmt.family === 'mp3') await media.trimMp3Trailers(input); // ID3v1 / APE trailers: cut, never copied
+  // (an MP3 arrives here already rebuilt from its frames: inPlaceEndpoint)
   // TRUE length by counting; then the remux is limited to exactly the packets
   // counted in the input (per stream) and bytes just over the input's
   const caps = stripCaps(await io.fileSize(input));
@@ -288,7 +372,7 @@ app.post('/strip-metadata', inPlaceEndpoint('strip', async ({ dir, input, conten
   await media.stripMedia(input, output, fmt, FFMPEG_TIMEOUT_MS, { frames: inPackets, maxBytes: caps.maxOutputBytes });
   await refuseIfCut(output, caps.maxOutputBytes, 'Stripped');
   const outPackets = (await counted(() => limits.packetCounts(output, STRIP_MAPS, Infinity, FFMPEG_TIMEOUT_MS, dir))).counts;
-  if (JSON.stringify(outPackets) !== JSON.stringify(inPackets)) throw new VerificationError(`output packets ${JSON.stringify(outPackets)} ≠ input ${JSON.stringify(inPackets)}`);
+  if (JSON.stringify(outPackets) !== JSON.stringify(inPackets)) throw unverified('packets-mismatch');
   if (fmt.family === 'iso') await media.blankMetadataBoxes(output);
   if (avc && fmt.family === 'iso') await neutralizeSei(output, codec);
   await verifyClean(output, fmt.family);
@@ -296,7 +380,7 @@ app.post('/strip-metadata', inPlaceEndpoint('strip', async ({ dir, input, conten
   // Same real picture and sound streams, same duration — before anything is written back
   const [inSum, outSum] = await Promise.all([media.streamSummary(input, PROBE_DEADLINE_MS), media.streamSummary(output, PROBE_DEADLINE_MS)]);
   if (!media.sameContent(inSum, outSum)) {
-    throw new VerificationError(`output doesn't match input (streams v${inSum.video}/a${inSum.audio} → v${outSum.video}/a${outSum.audio}, duration ${inSum.duration} → ${outSum.duration})`);
+    throw unverified('content-mismatch', { inVideo: inSum.video, inAudio: inSum.audio, outVideo: outSum.video, outAudio: outSum.audio });
   }
   const type = /^(video|audio)\//.test(contentType || '') ? contentType : 'application/octet-stream';
   return { file: output, contentType: type, log: { family: fmt.family } };
