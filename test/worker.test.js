@@ -428,15 +428,18 @@ async function endpoints() {
       const kept = path.join(tmp, `kept-${who}.mp3`);
       await writeFile(kept, pb.subarray(0, lastFrame.pos)); // the input's frames without the last one
       const keptHash = await packetHash(kept);
-      const cut100 = pb.subarray(0, pb.length - 100);
+      // the cut cases' remains: the last frame's payload planted (0x55 filler), never the encoder's bytes, so no chance
+      // header in them decides a case (they are dropped before any decode)
+      const pbCut = Buffer.from(pb).fill(0x55, lastFrame.pos + 4);
+      const cut100 = pbCut.subarray(0, pb.length - 100);
       for (const [label, bytes, remains] of [
         ['the last frame 100 bytes short', cut100],
-        ['the last frame 1 byte short', pb.subarray(0, pb.length - 1)],
+        ['the last frame 1 byte short', pbCut.subarray(0, pb.length - 1)],
         ['the last frame its 4-byte header only', pb.subarray(0, lastFrame.pos + 4)],
         ['the last frame 2 bytes of its header only', pb.subarray(0, lastFrame.pos + 2)],
         ['the last frame 2 bytes of its header, then an ID3v1', Buffer.concat([pb.subarray(0, lastFrame.pos + 2), v1(SECRET)])],
         ['the last frame its header, then zeros (as old rips end)', Buffer.concat([pb.subarray(0, lastFrame.pos + 4), Buffer.alloc(lastFrame.size - 130)])],
-        ['the last frame cut, its remains carrying text', Buffer.concat([pb.subarray(0, lastFrame.pos + 36), Buffer.from(SECRET, 'latin1')])],
+        ['the last frame cut, its remains carrying text', Buffer.concat([pbCut.subarray(0, lastFrame.pos + 36), Buffer.from(SECRET, 'latin1')])],
         ['the last frame cut, an ID3v1 after it', Buffer.concat([cut100, v1(SECRET)])],
         ['the last frame cut, an APE tag (items and footer) after it', Buffer.concat([cut100, ape(SECRET)])],
         ['the last frame cut, an APE tag with its header, then an ID3v1', Buffer.concat([cut100, apeWithHeader(SECRET), v1(SECRET)])],
@@ -462,7 +465,8 @@ async function endpoints() {
       const mid = packets[Math.floor(packets.length / 2)];
       const junk3 = Buffer.concat([junk, junk, junk]);
       for (const [label, bytes, where] of [
-        ['a middle frame 100 bytes short', Buffer.concat([pb.subarray(0, mid.pos + mid.size - 100), pb.subarray(mid.pos + mid.size)]), mid.pos + mid.size],
+        // (the walk lands 100 bytes into the next frame: those bytes planted, neither a header nor a zero)
+        ['a middle frame 100 bytes short', Buffer.concat([pb.subarray(0, mid.pos + mid.size - 100), pb.subarray(mid.pos + mid.size)]).fill(0x55, mid.pos + mid.size, mid.pos + mid.size + 4), mid.pos + mid.size],
         [`the last frame cut, then ${junk3.length} bytes of text`, Buffer.concat([cut100, junk3]), pb.length],
         [`the last frame cut, then ${junk3.length} bytes of text, then an ID3v1`, Buffer.concat([cut100, junk3, v1(SECRET)]), pb.length],
         ['every frame whole, then 3 bytes that don\'t start a header of this stream', Buffer.concat([pb, Buffer.from([0xff, pb[lastFrame.pos + 1] ^ 0x08, 0x90])]), pb.length],
@@ -673,7 +677,13 @@ async function endpoints() {
       const hiF = await enc(hi), loF = await enc(lo);
       const hb = await readFile(hiF), hp = await pktsOf(hiF), lp = await pktsOf(loF);
       const last = hp[hp.length - 1], mid = hp[Math.floor(hp.length / 2)];
-      const loFrame = (await readFile(loF)).subarray(lp[1].pos, lp[1].pos + lp[1].size);
+      // every byte a check below is about is planted, never the encoder's (the in-build run, 2026-11-05: Debian's ffmpeg
+      // 5.1.9 encodes other bytes than the Mac's 9.0.2, and four checks had stood on 9.0.2's). The headers and frame
+      // positions are the encode's; the payloads of the last frame and of the frames put after it are 0x55 filler (no
+      // 0xFF, no zero byte, no tag's letters). Nothing here decodes those bytes: a cut last frame is dropped before the
+      // decode, and the rest are refused before it or only rebuilt
+      hb.fill(0x55, last.pos + 4, last.pos + last.size);
+      const loFrame = Buffer.from((await readFile(loF)).subarray(lp[1].pos, lp[1].pos + lp[1].size)).fill(0x55, 4);
       const whole = hb.subarray(0, last.pos); // every frame but the last, byte for byte
       const cut = hb.subarray(0, last.pos + keep);
       const sameStream = mp3Frames.frameAt(loFrame).stream === mp3Frames.frameAt(hb.subarray(last.pos)).stream && keep + 2 * loFrame.length < last.size;
@@ -718,7 +728,12 @@ async function endpoints() {
       await refused(`its last ${hi} frame cut, a whole ${lo} frame (${loFrame.length} bytes) after it to the end (Astra's VBR case)`, Buffer.concat([cut, loFrame]), cut.length);
       await refused(`its last ${hi} frame cut, a whole ${lo} frame, then zero bytes to the end`, Buffer.concat([cut, loFrame, Buffer.alloc(20)]), cut.length);
       await refused(`two cut frames: its last ${hi} frame cut, a whole ${lo} frame, then a cut one`, Buffer.concat([cut, loFrame, loFrame.subarray(0, loFrame.length - 10)]), cut.length);
-      await refused(`two cut frames: one in the middle (50 bytes short), and the last`, Buffer.concat([hb.subarray(0, mid.pos + mid.size - 50), hb.subarray(mid.pos + mid.size, last.pos + keep)]), mid.pos + mid.size);
+      {
+        // (the walk lands 50 bytes into the next frame: those bytes planted, neither a header nor a zero)
+        const bytes = Buffer.concat([hb.subarray(0, mid.pos + mid.size - 50), hb.subarray(mid.pos + mid.size, last.pos + keep)]);
+        bytes.fill(0x55, mid.pos + mid.size, mid.pos + mid.size + 4);
+        await refused(`two cut frames: one in the middle (50 bytes short), and the last`, bytes, mid.pos + mid.size);
+      }
       // (the Reviewer's gaps on e485bf92) a complete frame confirmed by ONE byte, 0xFF, at the very end (the next
       // header's first byte): refused, promise 1. Its control: the same with a 0x55 byte instead, nothing confirming it: trimmed
       await refused(`its last ${hi} frame cut, a whole ${lo} frame, then one 0xFF byte ending the audio`, Buffer.concat([cut, loFrame, Buffer.from([0xff])]), cut.length);
@@ -726,7 +741,7 @@ async function endpoints() {
       // ...and a whole frame of ANOTHER stream (${otherRate} Hz, still Layer III) inside the cut frame, to the end: a
       // complete frame all the same (Astra's class on 8e107aec: any version, rate, bitrate or channel mode), refused
       const otherF = await enc('32k', otherRate), op = await pktsOf(otherF);
-      const otherFrame = (await readFile(otherF)).subarray(op[1].pos, op[1].pos + op[1].size);
+      const otherFrame = Buffer.from((await readFile(otherF)).subarray(op[1].pos, op[1].pos + op[1].size)).fill(0x55, 4);
       const otherStream = mp3Frames.frameAt(otherFrame).stream !== mp3Frames.frameAt(hb.subarray(last.pos)).stream && keep + otherFrame.length < last.size;
       check(`${rate} Hz, the ${otherRate} Hz frame is another stream and fits inside the cut ${hi} frame (so the next check proves something)`, otherStream);
       await refused(`its last ${hi} frame cut, a whole ${otherRate} Hz frame (another stream, ${otherFrame.length} bytes) after it to the end`, Buffer.concat([cut, otherFrame]), cut.length);
@@ -761,12 +776,19 @@ async function endpoints() {
       await refused(`its last ${hi} frame cut to ${L - 2 * n} bytes, then two whole ${lo} frames filling it to the byte`, Buffer.concat([upTo(L - 2 * n), loFrame, loFrame]), last.pos + L - 2 * n);
       await refused(`its last ${hi} frame cut to ${L - n} bytes, a whole ${lo} frame filling it, then an ID3v1 tag (read back from the end)`, Buffer.concat([upTo(L - n), loFrame, v1('x')]), last.pos + L - n);
       await refused(`its last ${hi} frame cut to ${L - n} bytes, a whole ${lo} frame filling it, then an ID3 v2.3 tag (walked over)`, Buffer.concat([upTo(L - n), loFrame, id3['v2.3']('x')]), last.pos + L - n);
+      // one byte over: the whole frame ends one byte before the end of the ${lo} frame, and the walk goes on at that
+      // byte, the ${lo} frame's last, planted three ways: 0x00 (a zero byte, dropped); 0xFF (the start of a header, cut
+      // by the end: headerStart in lib/mp3Frames, so the one incomplete final frame, trimmed); 0x55 (unaccounted,
+      // refused there). The first two only rebuilt: their whole last frame is planted filler, not audio to decode
+      for (const lb of [0x00, 0xff]) {
+        const lo1 = Buffer.from(loFrame); lo1[n - 1] = lb;
+        const bytes = Buffer.concat([upTo(L - n + 1), lo1]), r = await rebuild(bytes);
+        check(`${rate} Hz, one byte over: its last ${hi} frame cut to ${L - n + 1} bytes, then a whole ${lo} frame ending in ${lb ? '0xFF: the walk goes on at that byte, a header\'s first byte cut by the end, the one incomplete final frame: trimmed (cutFrame 1)' : '0x00: the walk goes on at that byte, a zero byte: dropped (cutFrame 0)'}; the rebuild the input less that byte, ${hp.length} frames`,
+          r.out?.equals(bytes.subarray(0, -1)) && r.frames === hp.length && r.cutFrame === (lb ? 1 : 0), JSON.stringify({ ...r, out: r.out?.length }));
+      }
       {
-        // one byte over: the whole frame ends one byte before the end of the ${lo} frame; the walk goes on at that byte,
-        // zero (dropped) or not (unaccounted)
-        const bytes = Buffer.concat([upTo(L - n + 1), loFrame]), r = await rebuild(bytes), z = loFrame[n - 1] === 0;
-        check(`${rate} Hz, one byte over: its last ${hi} frame cut to ${L - n + 1} bytes, then a whole ${lo} frame: the walk goes on at its last byte (${loFrame[n - 1]}): ${z ? 'a zero byte, dropped, the rest kept as it is' : 'refused there (mp3-structure)'}`,
-          z ? r.out?.equals(bytes.subarray(0, -1)) && r.frames === hp.length : r.code === `mp3-structure {"at":${last.pos + L}}`, JSON.stringify({ ...r, out: r.out?.length }));
+        const lo1 = Buffer.from(loFrame); lo1[n - 1] = 0x55;
+        await refused(`one byte over: its last ${hi} frame cut to ${L - n + 1} bytes, then a whole ${lo} frame ending in 0x55: the walk goes on at that byte, unaccounted`, Buffer.concat([upTo(L - n + 1), lo1]), last.pos + L);
       }
       await asIs(`its last ${hi} frame cut to ${L - n - 1} bytes, a whole ${lo} frame, then one 0x55 byte filling it (the chain ends a byte early)`, Buffer.concat([upTo(L - n - 1), loFrame, Buffer.from([0x55])]));
       await asIs(`its last ${hi} frame cut to ${L - n - 20} bytes, a whole ${lo} frame, then 20 zero bytes filling it (zeros after the chain are not followed)`, Buffer.concat([upTo(L - n - 20), loFrame, Buffer.alloc(20)]));
@@ -777,19 +799,20 @@ async function endpoints() {
           r.out?.equals(head) && r.frames === hp.length && r.cutFrame === 1, JSON.stringify({ ...r, out: r.out?.length }));
       }
       // the measured cost of refusing free-format outright: quiet and tonal frames' 0xFF filler holds free-format headers
-      // by chance (FF F3 03 at the end of a run, here). This sine's last frame holds one: cut past it, the file is
-      // refused, at it. Found by the test's own reading of the bytes (Layer III sync and layer bits, bitrate index 0)
+      // by chance (FF F3 03 at the end of a run, as 9.0.2's 44.1 kHz sine had and 5.1.9's hasn't). Planted here, at both
+      // rates: the last frame's own header with its bitrate index 0, ${keep + 40} bytes in (past the positive control's
+      // ${keep}); cut 20 bytes past it, the file is refused, at it. Checked by the test's own reading of the bytes
+      // (Layer III sync and layer bits, bitrate index 0)
       const ffIII = (b, i) => b[i] === 0xff && (b[i + 1] & 0xe6) === 0xe2 && ((b[i + 1] >> 3) & 3) !== 1 && b[i + 2] >> 4 === 0 && ((b[i + 2] >> 2) & 3) !== 3 && (b[i + 3] & 3) !== 2;
-      let ffq = -1;
-      for (let q = 1; q + 4 <= last.size && ffq < 0; q++) if (ffIII(hb, last.pos + q)) ffq = q;
-      if (rate === 44100) {
-        check(`${rate} Hz, the sine's last frame holds a chance free-format header (at ${ffq}), past the positive control's ${keep} bytes`, ffq > keep);
-        await refused(`its last ${hi} frame cut to ${ffq + 20} bytes, past a chance free-format header in it`, hb.subarray(0, last.pos + ffq + 20), last.pos + ffq);
-      } else check(`${rate} Hz, the sine's last frame holds no free-format header before the positive control's ${keep} bytes`, ffq < 0 || ffq + 4 > keep, `at ${ffq}`);
+      const ffq = keep + 40, withFree = Buffer.from(hb.subarray(0, last.pos + ffq + 20));
+      hiHeader.copy(withFree, last.pos + ffq); withFree[last.pos + ffq + 2] &= 0x0f;
+      check(`${rate} Hz, the planted header (at ${ffq} in the last frame) is a free-format one, and nothing else in that frame's remains reads as one`,
+        ffIII(withFree, last.pos + ffq) && Array.from({ length: ffq + 16 }, (_, q) => q + 1).every((q) => q === ffq || !ffIII(withFree, last.pos + q)));
+      await refused(`its last ${hi} frame cut to ${ffq + 20} bytes, past a free-format header planted in it at ${ffq}`, withFree, last.pos + ffq);
       // the filled frame's boundary one byte short (Astra's P2 on 56b93cef): a cut frame, so the rule above refuses it, at
-      // the whole ${lo} frame; or, at 44.1 kHz, earlier, at the chance free-format header in the sine's last frame
-      const short = L - n - 1, at1 = ffq >= 0 && ffq + 4 <= short ? ffq : short;
-      await refused(`one byte short: its last ${hi} frame cut to ${short} bytes, then a whole ${lo} frame (a cut frame: the rule above, refused at ${at1 === short ? `the ${lo} frame` : 'the chance free-format header'})`, Buffer.concat([upTo(short), loFrame]), last.pos + at1);
+      // the whole ${lo} frame
+      const short = L - n - 1;
+      await refused(`one byte short: its last ${hi} frame cut to ${short} bytes, then a whole ${lo} frame (a cut frame: the rule above, refused at the ${lo} frame)`, Buffer.concat([upTo(short), loFrame]), last.pos + short);
     }
     // fade-to-silence endings (the Reviewer, 2026-11-03): quiet frames' filler holds headers of the stream by chance
     // (two corpus encodes refused 3.8% and 5.9% of their honest cuts by the rule before this one). Tone bursts fading into
